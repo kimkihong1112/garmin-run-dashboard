@@ -3,19 +3,55 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
+import re
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
-import garth
 import requests
+from requests import Response, Session
+from requests.adapters import HTTPAdapter, Retry
+from requests_oauthlib import OAuth1Session
 from garminconnect import (
     Garmin,
     GarminConnectAuthenticationError,
     GarminConnectConnectionError,
 )
+
+GARMIN_DOMAIN = "garmin.com"
+GARMIN_SSO_URL = f"https://sso.{GARMIN_DOMAIN}/sso"
+GARMIN_SSO_EMBED_URL = f"{GARMIN_SSO_URL}/embed"
+GARMIN_SSO_EMBED_PARAMS = {
+    "id": "gauth-widget",
+    "embedWidget": "true",
+    "gauthHost": GARMIN_SSO_URL,
+}
+GARMIN_SIGNIN_PARAMS = {
+    **GARMIN_SSO_EMBED_PARAMS,
+    **{
+        "gauthHost": GARMIN_SSO_EMBED_URL,
+        "service": GARMIN_SSO_EMBED_URL,
+        "source": GARMIN_SSO_EMBED_URL,
+        "redirectAfterAccountLoginUrl": GARMIN_SSO_EMBED_URL,
+        "redirectAfterAccountCreationUrl": GARMIN_SSO_EMBED_URL,
+    },
+}
+GARMIN_MOBILE_USER_AGENT = "com.garmin.android.apps.connectmobile"
+GARMIN_APP_USER_AGENT = "GCM-iOS-5.19.1.2"
+OAUTH_CONSUMER_URL = "https://thegarth.s3.amazonaws.com/oauth_consumer.json"
+CSRF_RE = re.compile(r'name="_csrf"\s+value="(.+?)"')
+TITLE_RE = re.compile(r"<title>(.+?)</title>")
+TICKET_RE = re.compile(r'embed\?ticket=([^"]+)"')
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+AUTH_REQUEST_TIMEOUT_SECONDS = 12
+AUTH_RETRY_COUNT = 1
+SYNC_REQUEST_TIMEOUT_SECONDS = 12
+SYNC_RETRY_COUNT = 2
 
 
 def read_payload() -> dict[str, Any]:
@@ -61,14 +97,219 @@ def build_public_session(client: Garmin, email: str) -> dict[str, Any]:
     }
 
 
-def serialize_challenge_state(client_state: dict[str, Any]) -> str:
-    client = client_state["client"]
+def configure_retry_session(session: Session, retries: int, backoff_factor: float) -> None:
+    adapter = HTTPAdapter(
+        max_retries=Retry(
+            total=retries,
+            status_forcelist=(408, 500, 502, 503, 504),
+            backoff_factor=backoff_factor,
+        )
+    )
+    session.mount("https://", adapter)
+
+
+def build_auth_session() -> Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": GARMIN_APP_USER_AGENT})
+    configure_retry_session(session, retries=AUTH_RETRY_COUNT, backoff_factor=0.25)
+    return session
+
+
+def get_oauth_consumer(session: Session) -> dict[str, Any]:
+    try:
+        response = session.get(OAUTH_CONSUMER_URL, timeout=AUTH_REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise GarminConnectConnectionError(
+            f"Failed to load the Garmin OAuth consumer settings: {error}"
+        ) from error
+    return response.json()
+
+
+def get_csrf_token(html_text: str) -> str:
+    match = CSRF_RE.search(html_text)
+    if not match:
+        raise GarminConnectAuthenticationError(
+            "Garmin did not return a login form token. Please try again."
+        )
+    return match.group(1)
+
+
+def get_title(html_text: str) -> str:
+    match = TITLE_RE.search(html_text)
+    if not match:
+        raise GarminConnectAuthenticationError(
+            "Garmin returned an unexpected login response. Please try again."
+        )
+    return match.group(1)
+
+
+def strip_html(raw_text: str) -> str:
+    cleaned = HTML_TAG_RE.sub(" ", raw_text)
+    return " ".join(html.unescape(cleaned).split())
+
+
+def extract_page_error(html_text: str) -> str | None:
+    markers = [
+        "error-message",
+        "alert-danger",
+        "message--error",
+        "form-error",
+        "gauth-form-error",
+    ]
+
+    lowercase_html = html_text.lower()
+    for marker in markers:
+        marker_index = lowercase_html.find(marker)
+        if marker_index == -1:
+            continue
+
+        snippet = html_text[max(0, marker_index - 120) : marker_index + 420]
+        message = strip_html(snippet)
+        if message:
+            return message
+
+    return None
+
+
+def map_http_error(error: requests.HTTPError) -> GarminConnectConnectionError:
+    status_code = getattr(error.response, "status_code", None)
+
+    if status_code == 429:
+        return GarminConnectConnectionError(
+            "Garmin temporarily rate-limited the sign-in request. Wait a moment, then try again."
+        )
+
+    if status_code in {401, 403}:
+        return GarminConnectConnectionError(
+            "Garmin rejected the sign-in request. Double-check the email and password, then try again."
+        )
+
+    return GarminConnectConnectionError(f"Garmin request failed: {error}")
+
+
+def set_expirations(token: dict[str, Any]) -> dict[str, Any]:
+    token["expires_at"] = int(time.time() + int(token["expires_in"]))
+    token["refresh_token_expires_at"] = int(
+        time.time() + int(token["refresh_token_expires_in"])
+    )
+    return token
+
+
+def build_token_store(
+    oauth1_token: dict[str, Any],
+    oauth2_token: dict[str, Any],
+) -> str:
+    payload = json.dumps([oauth1_token, oauth2_token])
+    return base64.b64encode(payload.encode("utf-8")).decode("utf-8")
+
+
+def fetch_oauth1_token(ticket: str, session: Session) -> dict[str, Any]:
+    consumer = get_oauth_consumer(session)
+    oauth_session = OAuth1Session(
+        consumer["consumer_key"],
+        consumer["consumer_secret"],
+    )
+    oauth_session.headers.update({"User-Agent": GARMIN_MOBILE_USER_AGENT})
+    oauth_session.mount("https://", session.adapters["https://"])
+
+    login_url = GARMIN_SSO_EMBED_URL
+    url = (
+        f"https://connectapi.{GARMIN_DOMAIN}/oauth-service/oauth/preauthorized"
+        f"?ticket={ticket}&login-url={login_url}&accepts-mfa-tokens=true"
+    )
+    try:
+        response = oauth_session.get(url, timeout=AUTH_REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise GarminConnectConnectionError(
+            f"Failed to exchange the Garmin login ticket for an OAuth1 token: {error}"
+        ) from error
+
+    token = {key: values[0] for key, values in parse_qs(response.text).items()}
+    token["domain"] = GARMIN_DOMAIN
+    return token
+
+
+def exchange_oauth2_token(oauth1_token: dict[str, Any], session: Session) -> dict[str, Any]:
+    consumer = get_oauth_consumer(session)
+    oauth_session = OAuth1Session(
+        consumer["consumer_key"],
+        consumer["consumer_secret"],
+        resource_owner_key=oauth1_token["oauth_token"],
+        resource_owner_secret=oauth1_token["oauth_token_secret"],
+    )
+    oauth_session.headers.update({"User-Agent": GARMIN_MOBILE_USER_AGENT})
+    oauth_session.mount("https://", session.adapters["https://"])
+
+    data: dict[str, Any] = {}
+    if oauth1_token.get("mfa_token"):
+        data["mfa_token"] = oauth1_token["mfa_token"]
+
+    try:
+        response = oauth_session.post(
+            f"https://connectapi.{GARMIN_DOMAIN}/oauth-service/oauth/exchange/user/2.0",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=data,
+            timeout=AUTH_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise GarminConnectConnectionError(
+            f"Failed to exchange the Garmin OAuth1 token for OAuth2 access: {error}"
+        ) from error
+    token = response.json()
+    return set_expirations(token)
+
+
+def restore_session_from_tokens(email: str, token_store: str) -> dict[str, Any]:
+    client = Garmin()
+    client.login(tokenstore=token_store)
+    return {
+        "status": "authenticated",
+        "session": build_public_session(client, email),
+        "tokenStore": token_store,
+    }
+
+
+def request_page(
+    session: Session,
+    method: str,
+    url: str,
+    *,
+    previous_response: Response | None = None,
+    **kwargs: Any,
+) -> Response:
+    headers = kwargs.pop("headers", {})
+    if previous_response is not None:
+        headers = {**headers, "referer": previous_response.url}
+
+    try:
+        response = session.request(
+            method,
+            url,
+            headers=headers,
+            timeout=AUTH_REQUEST_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        raise map_http_error(error) from error
+    except requests.RequestException as error:
+        raise GarminConnectConnectionError(
+            f"Garmin sign-in request could not be completed: {error}"
+        ) from error
+
+    return response
+
+
+def serialize_challenge_state(challenge_state: dict[str, Any]) -> str:
     serialized = {
-        "domain": client.domain,
-        "signinParams": client_state["signin_params"],
-        "cookies": requests.utils.dict_from_cookiejar(client.sess.cookies),
-        "lastResponseText": client.last_resp.text,
-        "lastResponseUrl": client.last_resp.url,
+        "domain": GARMIN_DOMAIN,
+        "signinParams": challenge_state["signinParams"],
+        "cookies": requests.utils.dict_from_cookiejar(challenge_state["session"].cookies),
+        "lastResponseText": challenge_state["lastResponseText"],
+        "lastResponseUrl": challenge_state["lastResponseUrl"],
     }
     return base64.b64encode(json.dumps(serialized).encode("utf-8")).decode("utf-8")
 
@@ -77,19 +318,35 @@ def deserialize_challenge_state(encoded: str) -> dict[str, Any]:
     return json.loads(base64.b64decode(encoded.encode("utf-8")).decode("utf-8"))
 
 
-def restore_mfa_client(encoded_state: str) -> tuple[garth.Client, dict[str, Any]]:
+def restore_mfa_challenge(encoded_state: str) -> dict[str, Any]:
     challenge_state = deserialize_challenge_state(encoded_state)
-    client = garth.Client(domain=challenge_state["domain"])
-    client.sess.cookies = requests.utils.cookiejar_from_dict(challenge_state["cookies"])
+    session = build_auth_session()
+    session.cookies = requests.utils.cookiejar_from_dict(challenge_state["cookies"])
 
-    response = requests.Response()
+    response = Response()
     response.status_code = 200
     response.url = challenge_state["lastResponseUrl"]
     response._content = challenge_state["lastResponseText"].encode("utf-8")
     response.encoding = "utf-8"
-    client.last_resp = response
 
-    return client, challenge_state["signinParams"]
+    return {
+        "session": session,
+        "response": response,
+        "signinParams": challenge_state["signinParams"],
+    }
+
+
+def complete_login(session: Session, final_response: Response) -> str:
+    match = TICKET_RE.search(final_response.text)
+    if not match:
+        raise GarminConnectAuthenticationError(
+            "Garmin finished sign-in without returning an OAuth ticket."
+        )
+
+    ticket = match.group(1)
+    oauth1_token = fetch_oauth1_token(ticket, session)
+    oauth2_token = exchange_oauth2_token(oauth1_token, session)
+    return build_token_store(oauth1_token, oauth2_token)
 
 
 def complete_resume_login(email: str, encoded_state: str, mfa_code: str) -> dict[str, Any]:
@@ -98,13 +355,17 @@ def complete_resume_login(email: str, encoded_state: str, mfa_code: str) -> dict
             "Verification codes must contain exactly 6 digits."
         )
 
-    client, signin_params = restore_mfa_client(encoded_state)
-    csrf_token = garth.sso.get_csrf_token(client.last_resp.text)
-    client.post(
-        "sso",
-        "/sso/verifyMFA/loginEnterMfaCode",
+    challenge_state = restore_mfa_challenge(encoded_state)
+    session = challenge_state["session"]
+    previous_response = challenge_state["response"]
+    signin_params = challenge_state["signinParams"]
+    csrf_token = get_csrf_token(previous_response.text)
+    response = request_page(
+        session,
+        "POST",
+        f"{GARMIN_SSO_URL}/verifyMFA/loginEnterMfaCode",
         params=signin_params,
-        referrer=True,
+        previous_response=previous_response,
         data={
             "mfa-code": mfa_code,
             "embed": "true",
@@ -113,33 +374,15 @@ def complete_resume_login(email: str, encoded_state: str, mfa_code: str) -> dict
         },
     )
 
-    title = garth.sso.get_title(client.last_resp.text)
+    title = get_title(response.text)
     if title != "Success":
+        page_error = extract_page_error(response.text)
         raise GarminConnectAuthenticationError(
-            "Garmin did not accept the verification code."
+            page_error or "Garmin did not accept the verification code."
         )
 
-    garth.sso._complete_login(client)
-
-    garmin_client = Garmin()
-    garmin_client.garth = client
-
-    profile = garmin_client.garth.connectapi("/userprofile-service/userprofile/profile")
-    if profile and isinstance(profile, dict):
-        garmin_client.display_name = profile.get("displayName")
-        garmin_client.full_name = profile.get("fullName")
-
-    settings = garmin_client.garth.connectapi(
-        garmin_client.garmin_connect_user_settings_url
-    )
-    if settings and isinstance(settings, dict) and "userData" in settings:
-        garmin_client.unit_system = settings["userData"].get("measurementSystem")
-
-    return {
-        "status": "authenticated",
-        "session": build_public_session(garmin_client, email),
-        "tokenStore": garmin_client.garth.dumps(),
-    }
+    token_store = complete_login(session, response)
+    return restore_session_from_tokens(email, token_store)
 
 
 def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
@@ -151,22 +394,66 @@ def authenticate(payload: dict[str, Any]) -> dict[str, Any]:
             "Enter both your Garmin email and password."
         )
 
-    client = Garmin(email, password, return_on_mfa=True)
-    result1, result2 = client.login()
+    session = build_auth_session()
 
-    if result1 == "needs_mfa":
+    try:
+        embed_response = request_page(
+            session,
+            "GET",
+            GARMIN_SSO_EMBED_URL,
+            params=GARMIN_SSO_EMBED_PARAMS,
+        )
+        signin_page = request_page(
+            session,
+            "GET",
+            f"{GARMIN_SSO_URL}/signin",
+            params=GARMIN_SIGNIN_PARAMS,
+            previous_response=embed_response,
+        )
+        csrf_token = get_csrf_token(signin_page.text)
+        signin_response = request_page(
+            session,
+            "POST",
+            f"{GARMIN_SSO_URL}/signin",
+            params=GARMIN_SIGNIN_PARAMS,
+            previous_response=signin_page,
+            data={
+                "username": email,
+                "password": password,
+                "embed": "true",
+                "_csrf": csrf_token,
+            },
+        )
+    except requests.RequestException as error:
+        raise GarminConnectConnectionError(
+            f"Garmin sign-in request could not be completed: {error}"
+        ) from error
+
+    title = get_title(signin_response.text)
+
+    if "MFA" in title:
         return {
             "status": "mfa_required",
-            "message": "Garmin requested a six-digit verification code.",
-            "challengeState": serialize_challenge_state(result2),
+            "message": "Garmin requested a six-digit verification code. Check your email and enter it below.",
+            "challengeState": serialize_challenge_state(
+                {
+                    "session": session,
+                    "signinParams": GARMIN_SIGNIN_PARAMS,
+                    "lastResponseText": signin_response.text,
+                    "lastResponseUrl": signin_response.url,
+                }
+            ),
             "accountEmail": email,
         }
 
-    return {
-        "status": "authenticated",
-        "session": build_public_session(client, email),
-        "tokenStore": client.garth.dumps(),
-    }
+    if title != "Success":
+        page_error = extract_page_error(signin_response.text)
+        raise GarminConnectAuthenticationError(
+            page_error or "Garmin did not accept the email and password you entered."
+        )
+
+    token_store = complete_login(session, signin_response)
+    return restore_session_from_tokens(email, token_store)
 
 
 def pick_number(*values: Any) -> float | None:
@@ -305,6 +592,8 @@ def sync_running(payload: dict[str, Any]) -> dict[str, Any]:
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     client = Garmin()
+    configure_retry_session(client.garth.sess, retries=SYNC_RETRY_COUNT, backoff_factor=0.35)
+    client.garth.timeout = SYNC_REQUEST_TIMEOUT_SECONDS
     client.login(tokenstore=token_store)
 
     normalized_activities: list[dict[str, Any]] = []
@@ -414,11 +703,13 @@ def main() -> None:
     except (
         GarminConnectAuthenticationError,
         GarminConnectConnectionError,
-        garth.exc.GarthException,
         ValueError,
     ) as error:
         sys.stderr.write(str(error))
-        raise SystemExit(1) from error
+        raise SystemExit(1)
+    except Exception as error:
+        sys.stderr.write(str(error) or "The Garmin adapter failed unexpectedly.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

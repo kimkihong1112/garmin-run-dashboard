@@ -105,6 +105,32 @@ export function buildInitialSyncSummary(): SyncSummary {
   };
 }
 
+export function buildSyncingSummary(
+  previousSummary?: SyncSummary | null,
+  message = "Authenticated. Importing recent Garmin running activities in the background.",
+): SyncSummary {
+  return {
+    lastSyncedAt: previousSummary?.lastSyncedAt ?? new Date().toISOString(),
+    rawActivities: previousSummary?.rawActivities ?? 0,
+    normalizedActivities: previousSummary?.normalizedActivities ?? 0,
+    status: "syncing",
+    message,
+  };
+}
+
+export function buildSyncErrorSummary(
+  previousSummary: SyncSummary | null | undefined,
+  message: string,
+): SyncSummary {
+  return {
+    lastSyncedAt: previousSummary?.lastSyncedAt ?? new Date().toISOString(),
+    rawActivities: previousSummary?.rawActivities ?? 0,
+    normalizedActivities: previousSummary?.normalizedActivities ?? 0,
+    status: "error",
+    message,
+  };
+}
+
 export async function syncGarminRunningData(): Promise<SyncSummary> {
   if (isTauriRuntime()) {
     return invoke<SyncSummary>("sync_garmin_running_data");

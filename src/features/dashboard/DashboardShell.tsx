@@ -1,9 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { EffortRing } from "../../components/EffortRing";
 import { Heatmap } from "../../components/Heatmap";
+import { RouteGlyph } from "../../components/RouteGlyph";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { TrendChart } from "../../components/TrendChart";
-import { syncGarminRunningData } from "../../lib/garmin";
+import { getErrorMessage } from "../../lib/errors";
+import {
+  buildSyncErrorSummary,
+  buildSyncingSummary,
+  syncGarminRunningData,
+} from "../../lib/garmin";
 import { loadDashboardScenario } from "../../lib/dashboard";
 import type {
   DashboardRange,
@@ -17,6 +23,7 @@ import { DASHBOARD_FALLBACK_SCENARIOS, DASHBOARD_SEGMENTS } from "./dashboard-da
 
 interface DashboardShellProps {
   bootError: string | null;
+  isPreviewMode: boolean;
   onSignOut: () => Promise<void>;
   onSyncSummaryChange: (summary: SyncSummary) => Promise<void>;
   session: LoginSession;
@@ -60,8 +67,45 @@ function DistributionList({ items }: { items: DistributionSegment[] }) {
   );
 }
 
+const DEFAULT_ACTIVITY_COLUMNS = [
+  "Session",
+  "Date",
+  "Distance",
+  "Pace",
+  "Effort",
+];
+
+function buildActivityGridTemplate(columnCount: number) {
+  if (columnCount <= 1) {
+    return "minmax(0, 1fr)";
+  }
+
+  return `minmax(6.8rem, 1.15fr) repeat(${columnCount - 1}, minmax(6.4rem, 0.92fr))`;
+}
+
+function buildActivityValues(
+  activity: DashboardScenario["activities"][number],
+  columnCount: number,
+) {
+  const fallbackValues = [
+    activity.title,
+    activity.date,
+    activity.distance,
+    activity.pace,
+    activity.effort,
+  ];
+  const baseValues = activity.values ?? fallbackValues;
+
+  if (baseValues.length >= columnCount) {
+    return baseValues.slice(0, columnCount);
+  }
+
+  return [...baseValues, ...Array.from({ length: columnCount - baseValues.length }, () => "")];
+}
+
 export function DashboardShell({
   bootError,
+  isPreviewMode,
   onSignOut,
   onSyncSummaryChange,
   session,
@@ -74,7 +118,7 @@ export function DashboardShell({
   );
   const [isLoadingScenario, setIsLoadingScenario] = useState(true);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isManualSyncing, setIsManualSyncing] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -84,6 +128,11 @@ export function DashboardShell({
       setDashboardError(null);
 
       try {
+        if (isPreviewMode) {
+          setScenario(DASHBOARD_FALLBACK_SCENARIOS[range]);
+          return;
+        }
+
         const nextScenario = await loadDashboardScenario(range);
 
         if (!cancelled) {
@@ -92,9 +141,10 @@ export function DashboardShell({
       } catch (error) {
         if (!cancelled) {
           setDashboardError(
-            error instanceof Error
-              ? error.message
-              : "The dashboard data could not be loaded from local storage.",
+            getErrorMessage(
+              error,
+              "The dashboard data could not be loaded from local storage.",
+            ),
           );
           setScenario({
             ...DASHBOARD_FALLBACK_SCENARIOS[range],
@@ -116,28 +166,110 @@ export function DashboardShell({
     return () => {
       cancelled = true;
     };
-  }, [range, syncSummary.lastSyncedAt]);
+  }, [isPreviewMode, range, syncSummary.lastSyncedAt]);
 
   const handleSyncNow = async () => {
     setDashboardError(null);
-    setIsSyncing(true);
+    setIsManualSyncing(true);
+
+    if (isPreviewMode) {
+      await onSyncSummaryChange({
+        lastSyncedAt: new Date().toISOString(),
+        rawActivities: 24,
+        normalizedActivities: 24,
+        status: "preview",
+        message:
+          "Developer preview refreshed the mock dashboard state without calling Garmin.",
+      });
+      setIsManualSyncing(false);
+      return;
+    }
+
+    await onSyncSummaryChange(
+      buildSyncingSummary(
+        syncSummary,
+        "Refreshing your local Garmin running data from the desktop adapter.",
+      ),
+    );
 
     try {
       const nextSummary = await syncGarminRunningData();
       await onSyncSummaryChange(nextSummary);
     } catch (error) {
+      await onSyncSummaryChange(
+        buildSyncErrorSummary(
+          syncSummary,
+          getErrorMessage(
+            error,
+            "The Garmin sync did not complete successfully.",
+          ),
+        ),
+      );
       setDashboardError(
-        error instanceof Error
-          ? error.message
-          : "The Garmin sync did not complete successfully.",
+        getErrorMessage(
+          error,
+          "The Garmin sync did not complete successfully.",
+        ),
       );
     } finally {
-      setIsSyncing(false);
+      setIsManualSyncing(false);
     }
   };
 
   const lastSyncLabel =
     syncSummary.rawActivities > 0 ? formatTimestamp(syncSummary.lastSyncedAt) : "Not yet";
+  const activityColumns = scenario.activityColumns ?? DEFAULT_ACTIVITY_COLUMNS;
+  const activityTableStyle = {
+    "--activity-grid-template": buildActivityGridTemplate(activityColumns.length),
+  } as CSSProperties;
+  const isSyncing = isManualSyncing || syncSummary.status === "syncing";
+  const recentActivitySection = (
+    <section className="surface session-hero__activity">
+      <div className="surface-header">
+        <div>
+          <p className="surface-kicker">Recent activity</p>
+          <h3>{scenario.activityTitle}</h3>
+        </div>
+      </div>
+
+      {scenario.activityCaption ? (
+        <p className="surface-copy session-hero__activity-copy">{scenario.activityCaption}</p>
+      ) : null}
+
+      {scenario.activityHighlights?.length ? (
+        <div className="activity-highlight-strip">
+          {scenario.activityHighlights.map((highlight) => (
+            <article className="activity-highlight" key={highlight.label}>
+              <span>{highlight.label}</span>
+              <strong>{highlight.value}</strong>
+              <small>{highlight.delta}</small>
+            </article>
+          ))}
+        </div>
+      ) : null}
+
+      <div
+        className="activity-table"
+        role="table"
+        aria-label={scenario.activityTitle}
+        style={activityTableStyle}
+      >
+        <div className="activity-table__header" role="row">
+          {activityColumns.map((column) => (
+            <span key={column}>{column}</span>
+          ))}
+        </div>
+
+        {scenario.activities.map((activity) => (
+          <div className="activity-table__row" key={activity.title} role="row">
+            {buildActivityValues(activity, activityColumns.length).map((value, index) => (
+              <span key={`${activity.title}-${activityColumns[index]}`}>{value}</span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
 
   return (
     <div className="app-shell">
@@ -158,7 +290,13 @@ export function DashboardShell({
 
         <div className="sidebar-block">
           <span>Session vault</span>
-          <strong>{storageSnapshot ? "Keychain backed" : "Browser preview mode"}</strong>
+          <strong>
+            {isPreviewMode
+              ? "Developer preview"
+              : storageSnapshot
+                ? "Keychain backed"
+                : "Browser preview mode"}
+          </strong>
         </div>
 
         <div className="sidebar-block">
@@ -175,7 +313,11 @@ export function DashboardShell({
 
         <div className="sidebar-block sidebar-block--muted">
           <span>Database</span>
-          <p>{storageSnapshot?.databasePath ?? "Prepared when running inside Tauri."}</p>
+          <p>
+            {isPreviewMode
+              ? "Using curated mock analytics so we can iterate on the dashboard layout quickly."
+              : storageSnapshot?.databasePath ?? "Prepared when running inside Tauri."}
+          </p>
         </div>
 
         <div className="sidebar-actions">
@@ -185,7 +327,13 @@ export function DashboardShell({
             onClick={() => void handleSyncNow()}
             type="button"
           >
-            {isSyncing ? "Syncing Garmin..." : "Sync now"}
+            {isPreviewMode
+              ? isSyncing
+                ? "Refreshing preview..."
+                : "Refresh preview"
+              : isSyncing
+                ? "Syncing Garmin..."
+                : "Sync now"}
           </button>
 
           <button className="secondary-button" onClick={() => void onSignOut()} type="button">
@@ -243,22 +391,55 @@ export function DashboardShell({
           </section>
         ) : (
           <>
-            <section className="hero-surface">
-              <div className="hero-surface__copy">
-                <p className="surface-kicker">Primary insight</p>
+            <section className="session-hero">
+              <div className="session-hero__story">
+                <p className="surface-kicker">Session read</p>
                 <h2>{scenario.insightTitle}</h2>
                 <p className="workspace-copy">{scenario.insight}</p>
+                <div className="session-story__facts">
+                  <span>{scenario.activities.length} visible splits</span>
+                  <span>{scenario.routePoints ? "GPS trace included" : "Summary-only view"}</span>
+                  <span>{isPreviewMode ? "Preview data" : "Live local analytics"}</span>
+                </div>
               </div>
 
-              <div className="metric-strip">
-                {scenario.keyStats.map((stat) => (
-                  <div className="metric-tile" key={stat.label}>
-                    <span>{stat.label}</span>
-                    <strong>{stat.value}</strong>
-                    <small>{stat.delta}</small>
+              <div className="session-hero__route">
+                <div className="session-hero__route-header">
+                  <div>
+                    <p className="surface-kicker">
+                      {scenario.routePoints ? "Route trace" : "Primary context"}
+                    </p>
+                    <h3>{scenario.title}</h3>
                   </div>
+                  {isPreviewMode ? <span className="preview-pill">FIT-backed preview</span> : null}
+                </div>
+
+                {scenario.routePoints ? (
+                  <RouteGlyph
+                    geoPoints={scenario.geoRoutePoints}
+                    points={scenario.routePoints}
+                    title={scenario.title}
+                  />
+                ) : (
+                  <div className="route-placeholder" aria-hidden="true" />
+                )}
+
+                <p className="surface-copy">{scenario.description}</p>
+              </div>
+
+              <div className="metric-strip metric-strip--rail">
+                {scenario.keyStats.map((stat) => (
+                  <article className="metric-tile metric-tile--rail" key={stat.label}>
+                    <span>{stat.label}</span>
+                    <div className="metric-tile__value-row">
+                      <strong>{stat.value}</strong>
+                      <small>{stat.delta}</small>
+                    </div>
+                  </article>
                 ))}
               </div>
+
+              {recentActivitySection}
             </section>
 
             <section className="dashboard-grid">
@@ -269,38 +450,52 @@ export function DashboardShell({
                   title={scenario.trendTitle}
                 />
 
-                <section className="surface">
-                  <div className="surface-header">
-                    <div>
-                      <p className="surface-kicker">Recent activity</p>
-                      <h3>{scenario.activityTitle}</h3>
-                    </div>
-                  </div>
-
-                  <div
-                    className="activity-table"
-                    role="table"
-                    aria-label={scenario.activityTitle}
-                  >
-                    <div className="activity-table__header" role="row">
-                      <span>Session</span>
-                      <span>Date</span>
-                      <span>Distance</span>
-                      <span>Pace</span>
-                      <span>Effort</span>
-                    </div>
-
-                    {scenario.activities.map((activity) => (
-                      <div className="activity-table__row" key={activity.title} role="row">
-                        <span>{activity.title}</span>
-                        <span>{activity.date}</span>
-                        <span>{activity.distance}</span>
-                        <span>{activity.pace}</span>
-                        <span>{activity.effort}</span>
+                {scenario.splitPanels?.length ? (
+                  <section className="surface split-inspector">
+                    <div className="surface-header split-inspector__header">
+                      <div>
+                        <p className="surface-kicker">Raw lap metrics</p>
+                        <h3>{scenario.splitPanelsTitle ?? "Split inspector"}</h3>
                       </div>
-                    ))}
-                  </div>
-                </section>
+                      {scenario.splitPanelsCaption ? (
+                        <p className="surface-copy split-inspector__copy">
+                          {scenario.splitPanelsCaption}
+                        </p>
+                      ) : null}
+                    </div>
+
+                    <div className="split-panel-list">
+                      {scenario.splitPanels.map((split) => (
+                        <article className="split-panel" key={split.label}>
+                          <div className="split-panel__top">
+                            <div className="split-panel__copy">
+                              <span className="split-panel__label">{split.label}</span>
+                              <h4>{split.headline}</h4>
+                              <p>{split.summary}</p>
+                            </div>
+
+                            <div className="split-panel__timing">
+                              <strong>{split.time}</strong>
+                              <span>{split.pace}</span>
+                            </div>
+                          </div>
+
+                          <div className="split-panel__metrics">
+                            {split.metrics.map((metric) => (
+                              <div className="split-metric" key={`${split.label}-${metric.label}`}>
+                                <span>{metric.label}</span>
+                                <strong>{metric.value}</strong>
+                                <small>{metric.detail}</small>
+                              </div>
+                            ))}
+                          </div>
+
+                          <p className="split-panel__note">{split.note}</p>
+                        </article>
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
               </div>
 
               <div className="dashboard-grid__side">

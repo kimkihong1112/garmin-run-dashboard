@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { LoginScreen } from "./features/auth/LoginScreen";
 import { DashboardShell } from "./features/dashboard/DashboardShell";
+import { getErrorMessage } from "./lib/errors";
 import { buildInitialSyncSummary } from "./lib/garmin";
 import type { LoginSession, StorageSnapshot, SyncSummary } from "./lib/models";
 import {
@@ -13,6 +14,32 @@ import {
   persistSyncSummary,
 } from "./lib/storage";
 
+function buildDeveloperPreviewSession(): LoginSession {
+  const issuedAt = new Date();
+  const expiresAt = new Date(issuedAt.getTime() + 1000 * 60 * 60 * 24 * 14);
+
+  return {
+    athleteName: "Preview Runner",
+    fullName: "Dashboard Preview",
+    accountEmail: "preview@local.dev",
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    tokenLastFour: "VIEW",
+    unitSystem: "metric",
+  };
+}
+
+function buildDeveloperPreviewSummary(): SyncSummary {
+  return {
+    lastSyncedAt: new Date().toISOString(),
+    rawActivities: 24,
+    normalizedActivities: 24,
+    status: "preview",
+    message:
+      "Developer preview mode is using curated dashboard data so we can iterate without a live Garmin sign-in.",
+  };
+}
+
 export function App() {
   const [isBooting, setIsBooting] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -23,6 +50,7 @@ export function App() {
   const [syncSummary, setSyncSummary] = useState<SyncSummary>(
     buildInitialSyncSummary(),
   );
+  const [isDeveloperPreview, setIsDeveloperPreview] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -53,9 +81,10 @@ export function App() {
         }
 
         setBootError(
-          error instanceof Error
-            ? error.message
-            : "Failed to prepare the local application storage.",
+          getErrorMessage(
+            error,
+            "Failed to prepare the local application storage.",
+          ),
         );
       } finally {
         if (isMounted) {
@@ -75,13 +104,22 @@ export function App() {
     nextSession: LoginSession,
     nextSummary: SyncSummary,
   ) => {
+    setIsDeveloperPreview(false);
     await persistLoginSession(nextSession);
     await persistSyncSummary(nextSummary);
     setSession(nextSession);
     setSyncSummary(nextSummary);
   };
 
+  const handleOpenDeveloperPreview = () => {
+    setBootError(null);
+    setIsDeveloperPreview(true);
+    setSession(buildDeveloperPreviewSession());
+    setSyncSummary(buildDeveloperPreviewSummary());
+  };
+
   const handleSignOut = async () => {
+    setIsDeveloperPreview(false);
     await clearLoginSession();
     await clearSyncSummary();
     setSession(null);
@@ -111,7 +149,10 @@ export function App() {
     return (
       <LoginScreen
         bootError={bootError}
+        currentSyncSummary={syncSummary}
         onAuthenticated={handleAuthenticated}
+        onOpenDeveloperPreview={handleOpenDeveloperPreview}
+        onSyncSummaryChange={handleSyncSummaryChange}
         storageSnapshot={storageSnapshot}
       />
     );
@@ -120,6 +161,7 @@ export function App() {
   return (
     <DashboardShell
       bootError={bootError}
+      isPreviewMode={isDeveloperPreview}
       onSignOut={handleSignOut}
       onSyncSummaryChange={handleSyncSummaryChange}
       session={session}

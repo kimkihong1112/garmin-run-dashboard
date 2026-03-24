@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
+    thread,
+    time::{Duration as StdDuration, Instant},
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -17,6 +19,9 @@ const SESSION_SERVICE_NAME: &str = "com.kimkihong.garmin-run-dashboard.session";
 const DATABASE_FILE_NAME: &str = "garmin-run-dashboard.sqlite3";
 const LAST_SYNC_SUMMARY_FILE_NAME: &str = "last-sync-summary.json";
 const DEFAULT_SYNC_ACTIVITY_LIMIT: usize = 120;
+const AUTH_COMMAND_TIMEOUT_SECS: u64 = 45;
+const MFA_COMMAND_TIMEOUT_SECS: u64 = 30;
+const SYNC_COMMAND_TIMEOUT_SECS: u64 = 240;
 
 #[derive(Default)]
 struct GarminRuntimeState {
@@ -212,6 +217,8 @@ struct DashboardScenario {
     distribution_title: String,
     distribution: Vec<DistributionSegment>,
     activity_title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_columns: Option<Vec<String>>,
     activities: Vec<ActivityTableRow>,
     notes_title: String,
     notes: Vec<String>,
@@ -233,6 +240,7 @@ struct NormalizedActivityRow {
     elevation_gain_meters: Option<f64>,
     training_load: Option<f64>,
     activity_name: Option<String>,
+    raw_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +255,17 @@ struct ActivityRecord {
     max_heart_rate: Option<f64>,
     elevation_gain_meters: Option<f64>,
     training_load: Option<f64>,
+    raw_file_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SplitRecord {
+    label: String,
+    distance_meters: f64,
+    duration_seconds: f64,
+    average_pace_seconds_per_km: Option<f64>,
+    average_heart_rate: Option<f64>,
+    elevation_gain_meters: Option<f64>,
 }
 
 fn current_account_name() -> String {
@@ -257,21 +276,63 @@ fn now_iso_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn push_candidate_root(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    for ancestor in path.ancestors() {
+        let candidate = ancestor.to_path_buf();
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+}
+
+fn workspace_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(current_dir) = env::current_dir() {
+        push_candidate_root(&mut candidates, current_dir);
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(executable_dir) = current_exe.parent() {
+            push_candidate_root(&mut candidates, executable_dir.to_path_buf());
+        }
+    }
+
+    push_candidate_root(&mut candidates, PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    candidates
+}
+
 fn workspace_root() -> Result<PathBuf, String> {
-    env::current_dir().map_err(|error| format!("Unable to resolve the workspace root: {error}"))
+    let script_path = resolve_adapter_script_path()?;
+    script_path
+        .parent()
+        .and_then(|scripts_dir| scripts_dir.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "Unable to resolve the workspace root from adapter path {}.",
+                script_path.display()
+            )
+        })
 }
 
 fn resolve_adapter_script_path() -> Result<PathBuf, String> {
-    let script_path = workspace_root()?.join("scripts").join("garmin_adapter.py");
+    let mut searched_paths = Vec::new();
 
-    if script_path.exists() {
-        Ok(script_path)
-    } else {
-        Err(format!(
-            "The Garmin adapter script was not found at {}.",
-            script_path.display()
-        ))
+    for root in workspace_root_candidates() {
+        let script_path = root.join("scripts").join("garmin_adapter.py");
+        searched_paths.push(script_path.display().to_string());
+
+        if script_path.exists() {
+            return Ok(script_path);
+        }
     }
+
+    Err(format!(
+        "The Garmin adapter script was not found. Searched: {}.",
+        searched_paths.join(", ")
+    ))
 }
 
 fn resolve_python_executable() -> Result<PathBuf, String> {
@@ -525,7 +586,75 @@ fn prepare_local_store(app: &AppHandle) -> Result<StorageSnapshot, String> {
     })
 }
 
-fn run_python_adapter(command_name: &str, payload: &Value) -> Result<String, String> {
+fn summarize_adapter_output(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .last()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn normalize_adapter_error(detail: &str) -> String {
+    let lowercase = detail.to_ascii_lowercase();
+
+    if lowercase.contains("too many requests") || lowercase.contains("429") {
+        return "Garmin temporarily rate-limited the request. Wait a moment, then try again."
+            .to_string();
+    }
+
+    if lowercase.contains("timed out") || lowercase.contains("timeout") {
+        return "Garmin Connect took too long to respond. Check your internet connection and try again."
+            .to_string();
+    }
+
+    if lowercase.contains("failed to establish a new connection")
+        || lowercase.contains("name or service not known")
+        || lowercase.contains("nodename nor servname")
+    {
+        return "The app could not reach Garmin Connect. Check your internet connection and try again."
+            .to_string();
+    }
+
+    detail.to_string()
+}
+
+fn build_adapter_timeout_error(command_name: &str, timeout_secs: u64, detail: &str) -> String {
+    let action = match command_name {
+        "authenticate" => "Garmin sign-in",
+        "resume-mfa" => "Garmin email verification",
+        "sync-running" => "Garmin activity import",
+        _ => "The Garmin request",
+    };
+
+    let guidance = match command_name {
+        "authenticate" => {
+            "Check your internet connection, then try signing in again."
+        }
+        "resume-mfa" => {
+            "Make sure the latest email code is entered and try the verification step again."
+        }
+        "sync-running" => {
+            "Your existing local data is still safe, and you can retry the sync from the dashboard."
+        }
+        _ => "Try the Garmin request again.",
+    };
+
+    if detail.is_empty() {
+        format!("{action} did not finish within {timeout_secs} seconds. {guidance}")
+    } else {
+        format!(
+            "{action} did not finish within {timeout_secs} seconds. {guidance} Garmin adapter detail: {}",
+            normalize_adapter_error(detail)
+        )
+    }
+}
+
+fn run_python_adapter(
+    command_name: &str,
+    payload: &Value,
+    timeout_secs: u64,
+) -> Result<String, String> {
     let python = resolve_python_executable()?;
     let script = resolve_adapter_script_path()?;
 
@@ -544,10 +673,42 @@ fn run_python_adapter(command_name: &str, payload: &Value) -> Result<String, Str
             )
         })?;
 
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.to_string().as_bytes())
             .map_err(|error| format!("Unable to send input to the Garmin adapter: {error}"))?;
+    }
+
+    let started_at = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started_at.elapsed() >= StdDuration::from_secs(timeout_secs) {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().map_err(|error| {
+                        format!("Unable to read the Garmin adapter output: {error}")
+                    })?;
+                    let stderr = summarize_adapter_output(&String::from_utf8_lossy(&output.stderr));
+                    let stdout = summarize_adapter_output(&String::from_utf8_lossy(&output.stdout));
+                    let detail = if !stderr.is_empty() { stderr } else { stdout };
+
+                    return Err(build_adapter_timeout_error(
+                        command_name,
+                        timeout_secs,
+                        &detail,
+                    ));
+                }
+
+                thread::sleep(StdDuration::from_millis(125));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to monitor the Garmin adapter process: {error}"
+                ));
+            }
+        }
     }
 
     let output = child
@@ -559,14 +720,14 @@ fn run_python_adapter(command_name: &str, payload: &Value) -> Result<String, Str
             .map_err(|error| format!("Garmin adapter stdout was not valid UTF-8: {error}"));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = summarize_adapter_output(&String::from_utf8_lossy(&output.stderr));
+    let stdout = summarize_adapter_output(&String::from_utf8_lossy(&output.stdout));
     let detail = if !stderr.is_empty() { stderr } else { stdout };
 
     Err(if detail.is_empty() {
         "The Garmin adapter exited without a useful error message.".to_string()
     } else {
-        detail
+        normalize_adapter_error(&detail)
     })
 }
 
@@ -677,7 +838,8 @@ fn load_normalized_activities(
             max_heart_rate, \
             elevation_gain_meters, \
             training_load, \
-            json_extract(normalized_json, '$.activityName') AS activity_name \
+            json_extract(normalized_json, '$.activityName') AS activity_name, \
+            json_extract(normalized_json, '$.rawFilePath') AS raw_file_path \
          FROM activities_normalized \
          ORDER BY utc_start_at DESC \
          LIMIT {};",
@@ -726,6 +888,7 @@ fn load_normalized_activities(
             max_heart_rate: row.max_heart_rate,
             elevation_gain_meters: row.elevation_gain_meters,
             training_load: row.training_load,
+            raw_file_path: row.raw_file_path,
         });
     }
 
@@ -805,6 +968,180 @@ fn format_delta_percent(current: f64, previous: f64, fallback: &str) -> String {
 
 fn clamp_score(value: f64) -> u8 {
     value.round().clamp(0.0, 100.0) as u8
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+
+    Some(current)
+}
+
+fn first_value<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Value> {
+    paths.iter().find_map(|path| value_at_path(value, path))
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_f64(value: &Value, paths: &[&[&str]]) -> Option<f64> {
+    first_value(value, paths).and_then(value_as_f64)
+}
+
+fn extract_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    first_value(value, paths).and_then(|candidate| match candidate {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+}
+
+fn extract_array<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Vec<Value>> {
+    first_value(value, paths).and_then(Value::as_array)
+}
+
+fn load_split_records(activity: &ActivityRecord) -> Vec<SplitRecord> {
+    let Some(raw_file_path) = activity.raw_file_path.as_ref() else {
+        return Vec::new();
+    };
+
+    let Ok(raw_payload_text) = fs::read_to_string(raw_file_path) else {
+        return Vec::new();
+    };
+
+    let Ok(raw_payload): Result<Value, _> = serde_json::from_str(&raw_payload_text) else {
+        return Vec::new();
+    };
+
+    let Some(splits_value) = raw_payload.get("splits") else {
+        return Vec::new();
+    };
+
+    let split_items = if let Some(items) = splits_value.as_array() {
+        items
+    } else if let Some(items) = extract_array(
+        splits_value,
+        &[
+            &["lapDTOs"],
+            &["splitDTOs"],
+            &["splits"],
+            &["activitySplits"],
+            &["manualSplits"],
+        ],
+    ) {
+        items
+    } else {
+        return Vec::new();
+    };
+
+    split_items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let distance_meters = extract_f64(
+                item,
+                &[
+                    &["distance"],
+                    &["distanceInMeters"],
+                    &["sumDistance"],
+                    &["metrics", "distance"],
+                    &["summaryDTO", "distance"],
+                ],
+            )
+            .unwrap_or(0.0);
+
+            let duration_seconds = extract_f64(
+                item,
+                &[
+                    &["duration"],
+                    &["movingDuration"],
+                    &["elapsedDuration"],
+                    &["sumDuration"],
+                    &["summaryDTO", "duration"],
+                ],
+            )
+            .unwrap_or(0.0);
+
+            if distance_meters <= 0.0 && duration_seconds <= 0.0 {
+                return None;
+            }
+
+            let average_speed = extract_f64(
+                item,
+                &[
+                    &["averageSpeed"],
+                    &["avgSpeed"],
+                    &["speed"],
+                    &["summaryDTO", "averageSpeed"],
+                ],
+            );
+            let average_pace_seconds_per_km = if let Some(speed) = average_speed {
+                if speed > 0.0 {
+                    Some(1000.0 / speed)
+                } else {
+                    None
+                }
+            } else if distance_meters > 0.0 && duration_seconds > 0.0 {
+                Some(duration_seconds / (distance_meters / 1000.0))
+            } else {
+                None
+            };
+
+            let label = extract_string(
+                item,
+                &[
+                    &["lapLabel"],
+                    &["name"],
+                    &["label"],
+                    &["startTimeGMT"],
+                    &["startTimeGmt"],
+                    &["splitNumber"],
+                    &["lapIndex"],
+                ],
+            )
+            .map(|candidate| {
+                if candidate.chars().all(|character| character.is_ascii_digit()) {
+                    format!("Split {candidate}")
+                } else {
+                    candidate
+                }
+            })
+            .unwrap_or_else(|| format!("Split {}", index + 1));
+
+            Some(SplitRecord {
+                label,
+                distance_meters,
+                duration_seconds,
+                average_pace_seconds_per_km,
+                average_heart_rate: extract_f64(
+                    item,
+                    &[
+                        &["averageHR"],
+                        &["averageHr"],
+                        &["avgHr"],
+                        &["avgHeartRate"],
+                        &["summaryDTO", "averageHR"],
+                    ],
+                ),
+                elevation_gain_meters: extract_f64(
+                    item,
+                    &[
+                        &["elevationGain"],
+                        &["gain"],
+                        &["summaryDTO", "elevationGain"],
+                    ],
+                ),
+            })
+        })
+        .collect()
 }
 
 fn activity_bucket(activity: &ActivityRecord) -> &'static str {
@@ -945,6 +1282,7 @@ fn build_empty_dashboard(range: &str) -> DashboardScenario {
         distribution_title: "Workout mix".to_string(),
         distribution: vec![],
         activity_title: "Recent runs".to_string(),
+        activity_columns: None,
         activities: vec![],
         notes_title: "Coach notes".to_string(),
         notes: vec![],
@@ -957,6 +1295,7 @@ fn build_daily_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
     let selected = &activities[0];
     let recent_runs = &activities[..activities.len().min(7)];
     let recent_baseline = &activities[1..activities.len().min(6)];
+    let split_records = load_split_records(selected);
     let baseline_distance = average_distance(recent_baseline);
     let baseline_pace = average_pace(recent_baseline);
     let pace_delta = match (selected.average_pace_seconds_per_km, baseline_pace) {
@@ -987,18 +1326,124 @@ fn build_daily_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
         format_hr(selected.average_heart_rate),
     );
 
-    let trend = recent_runs
-        .iter()
-        .rev()
-        .map(|activity| TrendPoint {
-            label: activity.local_start_at.date().format("%m/%d").to_string(),
-            primary: activity
-                .average_pace_seconds_per_km
-                .map(|pace| pace / 60.0)
-                .unwrap_or_else(|| (activity.distance_meters / 1000.0).max(0.1)),
-            accent: activity.average_heart_rate,
-        })
-        .collect();
+    let (
+        trend_title,
+        trend_caption,
+        trend,
+        activity_title,
+        activity_columns,
+        activity_rows,
+        daily_notes,
+    ) =
+        if split_records.len() >= 2 {
+            let trend = split_records
+                .iter()
+                .enumerate()
+                .map(|(index, split)| TrendPoint {
+                    label: if split.label.len() > 10 {
+                        format!("S{}", index + 1)
+                    } else {
+                        split.label.clone()
+                    },
+                    primary: split
+                        .average_pace_seconds_per_km
+                        .map(|pace| pace / 60.0)
+                        .unwrap_or_else(|| (split.distance_meters / 1000.0).max(0.1)),
+                    accent: split.average_heart_rate,
+                })
+                .collect::<Vec<_>>();
+
+            let activity_rows = split_records
+                .iter()
+                .map(|split| ActivityTableRow {
+                    title: split.label.clone(),
+                    date: format!("{:.1} km", split.distance_meters / 1000.0),
+                    distance: format_duration(split.duration_seconds),
+                    pace: format_pace(split.average_pace_seconds_per_km),
+                    effort: format_hr(split.average_heart_rate),
+                })
+                .collect::<Vec<_>>();
+
+            let fastest_split = split_records
+                .iter()
+                .filter_map(|split| split.average_pace_seconds_per_km.map(|pace| (split, pace)))
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(split, _)| split.label.clone())
+                .unwrap_or_else(|| "the middle of the workout".to_string());
+
+            let slowest_split = split_records
+                .iter()
+                .filter_map(|split| split.average_pace_seconds_per_km.map(|pace| (split, pace)))
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(split, _)| split.label.clone())
+                .unwrap_or_else(|| "the closing split".to_string());
+
+            let total_split_climb = split_records
+                .iter()
+                .filter_map(|split| split.elevation_gain_meters)
+                .sum::<f64>();
+
+            (
+                "Pace by split".to_string(),
+                "Primary line shows split pace. Accent line shows split-average heart rate when Garmin provided it.".to_string(),
+                trend,
+                "Split breakdown".to_string(),
+                Some(vec![
+                    "Split".to_string(),
+                    "Distance".to_string(),
+                    "Duration".to_string(),
+                    "Pace".to_string(),
+                    "Avg HR".to_string(),
+                ]),
+                activity_rows,
+                vec![
+                    format!("The quickest split was {}, while the slowest was {}.", fastest_split, slowest_split),
+                    format!(
+                        "Garmin returned {} split records for this run, which the local app is using for detailed pacing review.",
+                        split_records.len()
+                    ),
+                    format!(
+                        "Split-level climbing totaled {} across the workout trace.",
+                        format_elevation(Some(total_split_climb))
+                    ),
+                ],
+            )
+        } else {
+            (
+                "Recent pace trend".to_string(),
+                "Primary line shows average pace across the latest runs. Accent line shows average heart rate.".to_string(),
+                recent_runs
+                    .iter()
+                    .rev()
+                    .map(|activity| TrendPoint {
+                        label: activity.local_start_at.date().format("%m/%d").to_string(),
+                        primary: activity
+                            .average_pace_seconds_per_km
+                            .map(|pace| pace / 60.0)
+                            .unwrap_or_else(|| (activity.distance_meters / 1000.0).max(0.1)),
+                        accent: activity.average_heart_rate,
+                    })
+                    .collect::<Vec<_>>(),
+                "Latest imported runs".to_string(),
+                None,
+                build_activity_rows(activities, 6),
+                vec![
+                    format!(
+                        "The latest effort was classified as {} based on distance, pace, and load.",
+                        activity_bucket(selected)
+                    ),
+                    format!(
+                        "Average pace currently sits at {} while the recent baseline sits near {}.",
+                        format_pace(selected.average_pace_seconds_per_km),
+                        format_pace(baseline_pace)
+                    ),
+                    format!(
+                        "Elevation gain reached {}, which helps explain the overall load score.",
+                        format_elevation(selected.elevation_gain_meters)
+                    ),
+                ],
+            )
+        };
 
     let load_score = clamp_score(
         selected.training_load.unwrap_or(0.0) * 0.6
@@ -1051,8 +1496,8 @@ fn build_daily_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
                 ),
             },
         ],
-        trend_title: "Recent pace trend".to_string(),
-        trend_caption: "Primary line shows average pace across the latest runs. Accent line shows average heart rate.".to_string(),
+        trend_title,
+        trend_caption,
         trend,
         ring: DashboardRing {
             value: load_score,
@@ -1068,24 +1513,11 @@ fn build_daily_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
         },
         distribution_title: "Recent run mix".to_string(),
         distribution: distribution_segments(&activities[..activities.len().min(14)]),
-        activity_title: "Latest imported runs".to_string(),
-        activities: build_activity_rows(activities, 6),
+        activity_title,
+        activity_columns,
+        activities: activity_rows,
         notes_title: "Execution notes".to_string(),
-        notes: vec![
-            format!(
-                "The latest effort was classified as {} based on distance, pace, and load.",
-                activity_bucket(selected)
-            ),
-            format!(
-                "Average pace currently sits at {} while the recent baseline sits near {}.",
-                format_pace(selected.average_pace_seconds_per_km),
-                format_pace(baseline_pace)
-            ),
-            format!(
-                "Elevation gain reached {}, which helps explain the overall load score.",
-                format_elevation(selected.elevation_gain_meters)
-            ),
-        ],
+        notes: daily_notes,
         heatmap_title: None,
         heatmap: None,
     }
@@ -1238,6 +1670,7 @@ fn build_weekly_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
         distribution_title: "Workout mix".to_string(),
         distribution: distribution_segments(&current_week),
         activity_title: "Runs captured this week".to_string(),
+        activity_columns: None,
         activities: build_activity_rows(&current_week, 6),
         notes_title: "Weekly coaching notes".to_string(),
         notes: vec![
@@ -1460,6 +1893,7 @@ fn build_monthly_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
         distribution_title: "Monthly run mix".to_string(),
         distribution: distribution_segments(&current_month),
         activity_title: "Monthly signature runs".to_string(),
+        activity_columns: None,
         activities: build_activity_rows(&current_month, 6),
         notes_title: "Month-end notes".to_string(),
         notes: vec![
@@ -1627,6 +2061,7 @@ fn authenticate_garmin(
             "email": credentials.email.trim().to_lowercase(),
             "password": credentials.password,
         }),
+        AUTH_COMMAND_TIMEOUT_SECS,
     )?;
 
     let response: GarminAdapterAuthResponse = serde_json::from_str(&output)
@@ -1669,12 +2104,12 @@ fn resume_garmin_mfa(
     runtime_state: State<GarminRuntimeState>,
 ) -> Result<GarminAuthResponse, String> {
     let pending = {
-        let mut guard = runtime_state
+        let guard = runtime_state
             .pending_mfa_challenge
             .lock()
             .map_err(|_| "Unable to lock the Garmin MFA runtime state.".to_string())?;
         guard
-            .take()
+            .clone()
             .ok_or_else(|| "No pending Garmin MFA challenge is available.".to_string())?
     };
 
@@ -1685,6 +2120,7 @@ fn resume_garmin_mfa(
             "challengeState": pending.challenge_state,
             "mfaCode": mfa_code.trim(),
         }),
+        MFA_COMMAND_TIMEOUT_SECS,
     )?;
 
     let response: GarminAdapterAuthResponse = serde_json::from_str(&output)
@@ -1699,6 +2135,12 @@ fn resume_garmin_mfa(
                 session: session.clone(),
                 token_store,
             })?;
+
+            let mut guard = runtime_state
+                .pending_mfa_challenge
+                .lock()
+                .map_err(|_| "Unable to lock the Garmin MFA runtime state.".to_string())?;
+            *guard = None;
 
             Ok(GarminAuthResponse::Authenticated { session })
         }
@@ -1745,6 +2187,7 @@ fn sync_garmin_running_data(app: AppHandle) -> Result<SyncSummary, String> {
             "maxActivities": DEFAULT_SYNC_ACTIVITY_LIMIT,
             "accountEmail": stored_session.session.account_email,
         }),
+        SYNC_COMMAND_TIMEOUT_SECS,
     )?;
 
     let response: GarminAdapterSyncResponse = serde_json::from_str(&output)
@@ -1849,6 +2292,7 @@ mod tests {
             max_heart_rate: Some(average_heart_rate + 12.0),
             elevation_gain_meters: Some(55.0),
             training_load: Some(training_load),
+            raw_file_path: None,
         }
     }
 

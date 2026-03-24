@@ -71,12 +71,39 @@ export interface ActivityTableRow {
   distance: string;
   pace: string;
   effort: string;
+  values?: string[];
 }
 
 export interface HeatmapCell {
   label: string;
   value: number;
   level: number;
+}
+
+export interface RoutePoint {
+  x: number;
+  y: number;
+}
+
+export interface GeoRoutePoint {
+  latitude: number;
+  longitude: number;
+}
+
+export interface SplitMetric {
+  label: string;
+  value: string;
+  detail: string;
+}
+
+export interface SplitPanel {
+  label: string;
+  headline: string;
+  summary: string;
+  time: string;
+  pace: string;
+  note: string;
+  metrics: SplitMetric[];
 }
 
 export interface DashboardScenario {
@@ -100,9 +127,17 @@ export interface DashboardScenario {
   distributionTitle: string;
   distribution: DistributionSegment[];
   activityTitle: string;
+  activityCaption?: string;
+  activityHighlights?: MetricStat[];
+  activityColumns?: string[];
   activities: ActivityTableRow[];
+  splitPanelsTitle?: string;
+  splitPanelsCaption?: string;
+  splitPanels?: SplitPanel[];
   notesTitle: string;
   notes: string[];
+  routePoints?: RoutePoint[];
+  geoRoutePoints?: GeoRoutePoint[];
   heatmapTitle?: string;
   heatmap?: HeatmapCell[];
 }

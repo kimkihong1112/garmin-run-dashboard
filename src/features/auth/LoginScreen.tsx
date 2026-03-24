@@ -1,6 +1,9 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
+import { getErrorMessage } from "../../lib/errors";
 import {
   authenticateGarmin,
+  buildSyncErrorSummary,
+  buildSyncingSummary,
   MOCK_MFA_HINT,
   syncGarminRunningData,
 } from "../../lib/garmin";
@@ -14,10 +17,13 @@ import type {
 
 interface LoginScreenProps {
   bootError: string | null;
+  currentSyncSummary: SyncSummary;
   onAuthenticated: (
     session: LoginSession,
     summary: SyncSummary,
   ) => Promise<void>;
+  onOpenDeveloperPreview: () => void;
+  onSyncSummaryChange: (summary: SyncSummary) => Promise<void>;
   storageSnapshot: StorageSnapshot | null;
 }
 
@@ -29,7 +35,10 @@ const INITIAL_VALUES: LoginCredentials = {
 
 export function LoginScreen({
   bootError,
+  currentSyncSummary,
   onAuthenticated,
+  onOpenDeveloperPreview,
+  onSyncSummaryChange,
   storageSnapshot,
 }: LoginScreenProps) {
   const [credentials, setCredentials] =
@@ -38,7 +47,27 @@ export function LoginScreen({
   const [isMfaVisible, setIsMfaVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [progressHint, setProgressHint] = useState<string | null>(null);
   const [submitPhase, setSubmitPhase] = useState<"idle" | "auth" | "sync">("idle");
+
+  useEffect(() => {
+    if (!isSubmitting) {
+      setProgressHint(null);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setProgressHint(
+        submitPhase === "auth"
+          ? "Still waiting on Garmin Connect. This can take a few seconds, especially when Garmin is preparing an email verification challenge."
+          : "The app has your session and is still importing recent runs in the background.",
+      );
+    }, 5000);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [isSubmitting, submitPhase]);
 
   const handleChange = (field: keyof LoginCredentials, value: string) => {
     setCredentials((current) => ({
@@ -50,7 +79,8 @@ export function LoginScreen({
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
-    setNotice(null);
+    setNotice("Connecting to Garmin Connect...");
+    setProgressHint(null);
     setIsSubmitting(true);
     setSubmitPhase("auth");
 
@@ -59,37 +89,45 @@ export function LoginScreen({
 
       if (result.status === "mfa_required") {
         setIsMfaVisible(true);
-        setNotice(result.message);
+        setNotice(
+          result.message ||
+            "Garmin requested a verification code. Check your email and enter the code below.",
+        );
         setSubmitPhase("idle");
         return;
       }
 
-      setNotice("Authenticated. Importing recent Garmin running activities...");
+      setNotice("Authenticated. Opening your dashboard...");
       setSubmitPhase("sync");
 
-      let syncSummary: SyncSummary;
+      const pendingSummary = buildSyncingSummary(currentSyncSummary);
+      await onAuthenticated(result.session, pendingSummary);
 
-      try {
-        syncSummary = await syncGarminRunningData();
-      } catch (syncError) {
-        syncSummary = {
-          lastSyncedAt: new Date().toISOString(),
-          rawActivities: 0,
-          normalizedActivities: 0,
-          status: "error",
-          message:
-            syncError instanceof Error
-              ? syncError.message
-              : "Garmin sign-in succeeded, but the first sync did not complete.",
-        };
-      }
+      const runBackgroundSync = async () => {
+        try {
+          const syncSummary = await syncGarminRunningData();
+          await onSyncSummaryChange(syncSummary);
+        } catch (syncError) {
+          await onSyncSummaryChange(
+            buildSyncErrorSummary(
+              currentSyncSummary,
+              getErrorMessage(
+                syncError,
+                "Garmin sign-in succeeded, but the first sync did not complete.",
+              ),
+            ),
+          );
+        }
+      };
 
-      await onAuthenticated(result.session, syncSummary);
+      void runBackgroundSync();
     } catch (authError) {
+      setNotice(null);
       setError(
-        authError instanceof Error
-          ? authError.message
-          : "The Garmin authentication flow could not be completed.",
+        getErrorMessage(
+          authError,
+          "The Garmin authentication flow could not be completed.",
+        ),
       );
     } finally {
       setSubmitPhase("idle");
@@ -182,27 +220,50 @@ export function LoginScreen({
                   type="text"
                   value={credentials.mfaCode}
                 />
+                <small className="field-help">
+                  Garmin requested MFA. Enter the verification code sent to your
+                  email to continue.
+                </small>
               </label>
-            ) : (
-              <button
-                className="text-button"
-                onClick={() => setIsMfaVisible(true)}
-                type="button"
-              >
-                Need to enter a verification code?
-              </button>
-            )}
+            ) : null}
 
             <button className="primary-button" disabled={isSubmitting} type="submit">
               {isSubmitting
                 ? submitPhase === "sync"
-                  ? "Syncing recent runs..."
-                  : "Authenticating..."
+                  ? "Opening dashboard..."
+                  : "Connecting to Garmin..."
                 : "Sign in securely"}
+            </button>
+
+            <button
+              className="secondary-button auth-preview-button"
+              onClick={onOpenDeveloperPreview}
+              type="button"
+            >
+              Open dashboard preview
             </button>
           </form>
 
-          {notice ? <p className="notice-copy">{notice}</p> : null}
+          {isSubmitting ? (
+            <div aria-live="polite" className="auth-progress" role="status">
+              <span aria-hidden="true" className="auth-progress__spinner" />
+              <div>
+                <strong>
+                  {submitPhase === "sync"
+                    ? "Preparing your dashboard"
+                    : "Contacting Garmin Connect"}
+                </strong>
+                <p>
+                  {submitPhase === "sync"
+                    ? "Sign-in completed. Recent runs are being imported in the background so the app can move forward immediately."
+                    : "Checking your credentials and waiting to see whether Garmin asks for an email verification code."}
+                </p>
+              </div>
+            </div>
+          ) : null}
+
+          {progressHint ? <p className="notice-copy">{progressHint}</p> : null}
+          {notice && !progressHint ? <p className="notice-copy">{notice}</p> : null}
           {error ? <p className="error-copy">{error}</p> : null}
           {bootError ? <p className="error-copy">{bootError}</p> : null}
 
@@ -211,6 +272,14 @@ export function LoginScreen({
             <p>
               Tokens are stored in the system keychain in the current macOS
               scaffold.
+            </p>
+            <p>
+              The verification code field appears only after Garmin confirms
+              that MFA is required for the current sign-in attempt.
+            </p>
+            <p>
+              Developer preview opens the dashboard with curated local mock
+              data and does not require a Garmin login.
             </p>
           </div>
         </div>
