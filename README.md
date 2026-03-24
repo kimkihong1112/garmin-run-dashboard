@@ -7,8 +7,9 @@ This repository currently includes:
 - a rewritten English product requirements document
 - a technical architecture document
 - an initial Tauri + React + TypeScript app shell
+- a Garmin Connect adapter bridge using Python, `garth`, and `garminconnect`
 - a login flow that expands for MFA challenges
-- local storage foundations for secure session persistence and SQLite bootstrap
+- local storage foundations for secure session persistence, raw JSON ingestion, and SQLite bootstrap
 
 ## Product Direction
 
@@ -20,19 +21,32 @@ This repository currently includes:
 
 ## Current Status
 
-The Garmin integration is intentionally scaffolded behind an adapter boundary because Garmin Connect does not provide an official public API for this use case. The current build includes a mocked login/sync path so the secure storage, dashboard structure, and local data pipeline can be developed before the live connector is finalized.
+The Garmin integration is intentionally isolated behind an adapter boundary because Garmin Connect does not provide an official public API for this use case. The current build uses a local Python adapter built on top of `garth` and `garminconnect`, while the Tauri backend remains responsible for secure token storage, raw file persistence, and SQLite normalization.
 
 ## Quick Start
 
 ```bash
 npm install
+npm run setup:garmin-adapter
 npm run tauri dev
 ```
 
-For the current mock auth flow:
+## Garmin Adapter Setup
 
-- any valid-looking email/password pair signs in
-- an email containing `+mfa` will trigger the MFA expansion path
+The live Garmin adapter requires Python 3.12+ because the current `garth` and `garminconnect` packages target Python 3.10 or newer.
+
+The setup script creates a local virtualenv at `.venv-garmin` and installs the adapter dependencies:
+
+```bash
+npm run setup:garmin-adapter
+```
+
+If you prefer to do it manually:
+
+```bash
+/opt/homebrew/bin/python3.12 -m venv .venv-garmin
+.venv-garmin/bin/pip install garminconnect
+```
 
 ## Project Structure
 
@@ -45,6 +59,7 @@ src/
   features/
   lib/
   styles/
+scripts/
 src-tauri/
   migrations/
   src/
@@ -64,5 +79,5 @@ Sensitive login session payloads are stored in the macOS Keychain rather than in
 ## Notes
 
 - All documentation and code comments are written in English for public collaboration.
-- The current scaffold focuses on the product foundation, secure local storage, and dashboard UX.
-- Live Garmin sync, parsing, reconciliation, and data quality validation should be implemented next.
+- Raw Garmin activity payloads are written to local JSON files under the app data directory during sync.
+- The current sync path stores normalized running summaries in SQLite and preserves detailed raw JSON on disk for future reprocessing.
