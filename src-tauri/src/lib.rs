@@ -1819,3 +1819,80 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_activity(
+        year: i32,
+        month: u32,
+        day: u32,
+        distance_meters: f64,
+        duration_seconds: f64,
+        average_pace_seconds_per_km: f64,
+        average_heart_rate: f64,
+        training_load: f64,
+        name: &str,
+    ) -> ActivityRecord {
+        let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        let timestamp = date.and_hms_opt(6, 30, 0).unwrap();
+
+        ActivityRecord {
+            activity_name: name.to_string(),
+            local_start_at: timestamp,
+            utc_start_at: timestamp,
+            distance_meters,
+            duration_seconds,
+            average_pace_seconds_per_km: Some(average_pace_seconds_per_km),
+            average_heart_rate: Some(average_heart_rate),
+            max_heart_rate: Some(average_heart_rate + 12.0),
+            elevation_gain_meters: Some(55.0),
+            training_load: Some(training_load),
+        }
+    }
+
+    #[test]
+    fn empty_dashboard_is_returned_when_no_activities_exist() {
+        let scenario = build_dashboard_scenario("daily", &[]);
+
+        assert_eq!(scenario.is_empty, Some(true));
+        assert!(scenario.empty_title.is_some());
+        assert!(scenario.key_stats.is_empty());
+    }
+
+    #[test]
+    fn weekly_dashboard_aggregates_recent_runs() {
+        let activities = vec![
+            sample_activity(2026, 3, 24, 12000.0, 3200.0, 266.0, 151.0, 88.0, "Tempo"),
+            sample_activity(2026, 3, 23, 8000.0, 2700.0, 337.0, 139.0, 46.0, "Easy"),
+            sample_activity(2026, 3, 21, 21000.0, 6200.0, 295.0, 148.0, 112.0, "Long"),
+            sample_activity(2026, 3, 18, 9000.0, 3000.0, 333.0, 140.0, 52.0, "Prior week"),
+        ];
+
+        let scenario = build_weekly_dashboard(&activities);
+
+        assert_eq!(scenario.eyebrow, "Weekly review");
+        assert_eq!(scenario.key_stats[0].value, "50.0 km");
+        assert_eq!(scenario.trend.len(), 7);
+        assert!(!scenario.activities.is_empty());
+    }
+
+    #[test]
+    fn monthly_dashboard_builds_heatmap_and_signature_runs() {
+        let activities = vec![
+            sample_activity(2026, 3, 29, 28000.0, 8200.0, 293.0, 149.0, 124.0, "Long run"),
+            sample_activity(2026, 3, 24, 12000.0, 3300.0, 275.0, 154.0, 95.0, "Tempo"),
+            sample_activity(2026, 3, 19, 10000.0, 2550.0, 255.0, 162.0, 108.0, "10K effort"),
+            sample_activity(2026, 3, 11, 13600.0, 3680.0, 271.0, 150.0, 101.0, "Cruise intervals"),
+            sample_activity(2026, 2, 20, 9000.0, 3100.0, 344.0, 138.0, 51.0, "Previous month"),
+        ];
+
+        let scenario = build_monthly_dashboard(&activities);
+
+        assert_eq!(scenario.eyebrow, "Monthly review");
+        assert_eq!(scenario.key_stats[0].value, "63.6 km");
+        assert!(scenario.heatmap.is_some());
+        assert!(!scenario.activities.is_empty());
+    }
+}
