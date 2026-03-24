@@ -27,7 +27,6 @@ export async function bootstrapLocalStore(): Promise<StorageSnapshot | null> {
 
 export async function persistLoginSession(session: LoginSession) {
   if (isTauriRuntime()) {
-    await invoke("store_login_session", { session });
     return;
   }
 
@@ -68,4 +67,13 @@ export async function loadSyncSummary(): Promise<SyncSummary | null> {
   }
 
   return parseJson<SyncSummary>(localStorage.getItem(SYNC_KEY));
+}
+
+export async function clearSyncSummary() {
+  if (isTauriRuntime()) {
+    await invoke("clear_sync_summary");
+    return;
+  }
+
+  localStorage.removeItem(SYNC_KEY);
 }

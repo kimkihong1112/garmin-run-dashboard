@@ -1,19 +1,14 @@
-import type { LoginCredentials, LoginSession, SyncSummary } from "./models";
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  GarminAuthResult,
+  LoginCredentials,
+  LoginSession,
+  SyncSummary,
+} from "./models";
+import { isTauriRuntime } from "./tauri";
 
 export const MOCK_MFA_HINT =
-  "Developer note: use an email containing +mfa to preview the MFA challenge path in this scaffold.";
-
-interface GarminAuthChallenge {
-  status: "mfa_required";
-  message: string;
-}
-
-interface GarminAuthSuccess {
-  status: "authenticated";
-  session: LoginSession;
-}
-
-export type GarminAuthResult = GarminAuthChallenge | GarminAuthSuccess;
+  "Browser preview mode uses a local mock login. The desktop runtime uses the Python Garmin adapter.";
 
 function delay(duration: number) {
   return new Promise((resolve) => {
@@ -39,6 +34,21 @@ function buildTokenLastFour(email: string) {
 export async function authenticateGarmin(
   credentials: LoginCredentials,
 ): Promise<GarminAuthResult> {
+  if (isTauriRuntime()) {
+    if (credentials.mfaCode?.trim()) {
+      return invoke<GarminAuthResult>("resume_garmin_mfa", {
+        mfaCode: credentials.mfaCode.trim(),
+      });
+    }
+
+    return invoke<GarminAuthResult>("authenticate_garmin", {
+      credentials: {
+        email: credentials.email.trim(),
+        password: credentials.password,
+      },
+    });
+  }
+
   await delay(820);
 
   const email = credentials.email.trim().toLowerCase();
@@ -74,20 +84,40 @@ export async function authenticateGarmin(
     status: "authenticated",
     session: {
       athleteName: buildAthleteName(email) || "Garmin Runner",
+      fullName: buildAthleteName(email) || "Garmin Runner",
+      accountEmail: email,
       expiresAt: expiresAt.toISOString(),
       issuedAt: issuedAt.toISOString(),
       tokenLastFour: buildTokenLastFour(email),
+      unitSystem: "metric",
     },
   };
 }
 
 export function buildInitialSyncSummary(): SyncSummary {
   return {
+    lastSyncedAt: new Date(0).toISOString(),
+    rawActivities: 0,
+    normalizedActivities: 0,
+    status: "idle",
+    message:
+      "No Garmin activities have been imported yet. Sign in to start the first local sync.",
+  };
+}
+
+export async function syncGarminRunningData(): Promise<SyncSummary> {
+  if (isTauriRuntime()) {
+    return invoke<SyncSummary>("sync_garmin_running_data");
+  }
+
+  await delay(1200);
+
+  return {
     lastSyncedAt: new Date().toISOString(),
-    rawActivities: 186,
-    normalizedActivities: 186,
+    rawActivities: 24,
+    normalizedActivities: 24,
     status: "ready",
     message:
-      "Mock sync completed. Local storage is ready for raw ingestion and normalized analytics.",
+      "Browser preview mode simulated a running sync. The desktop runtime will fetch live Garmin data.",
   };
 }

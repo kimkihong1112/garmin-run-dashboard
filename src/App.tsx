@@ -6,6 +6,7 @@ import type { LoginSession, StorageSnapshot, SyncSummary } from "./lib/models";
 import {
   bootstrapLocalStore,
   clearLoginSession,
+  clearSyncSummary,
   loadLoginSession,
   loadSyncSummary,
   persistLoginSession,
@@ -82,6 +83,7 @@ export function App() {
 
   const handleSignOut = async () => {
     await clearLoginSession();
+    await clearSyncSummary();
     setSession(null);
     setSyncSummary(buildInitialSyncSummary());
   };

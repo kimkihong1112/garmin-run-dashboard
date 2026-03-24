@@ -1,10 +1,11 @@
 import { useState, type FormEvent } from "react";
 import {
   authenticateGarmin,
-  buildInitialSyncSummary,
   MOCK_MFA_HINT,
+  syncGarminRunningData,
 } from "../../lib/garmin";
 import type {
+  GarminAuthResult,
   LoginCredentials,
   LoginSession,
   StorageSnapshot,
@@ -37,6 +38,7 @@ export function LoginScreen({
   const [isMfaVisible, setIsMfaVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [submitPhase, setSubmitPhase] = useState<"idle" | "auth" | "sync">("idle");
 
   const handleChange = (field: keyof LoginCredentials, value: string) => {
     setCredentials((current) => ({
@@ -50,17 +52,39 @@ export function LoginScreen({
     setError(null);
     setNotice(null);
     setIsSubmitting(true);
+    setSubmitPhase("auth");
 
     try {
-      const result = await authenticateGarmin(credentials);
+      const result: GarminAuthResult = await authenticateGarmin(credentials);
 
       if (result.status === "mfa_required") {
         setIsMfaVisible(true);
         setNotice(result.message);
+        setSubmitPhase("idle");
         return;
       }
 
-      await onAuthenticated(result.session, buildInitialSyncSummary());
+      setNotice("Authenticated. Importing recent Garmin running activities...");
+      setSubmitPhase("sync");
+
+      let syncSummary: SyncSummary;
+
+      try {
+        syncSummary = await syncGarminRunningData();
+      } catch (syncError) {
+        syncSummary = {
+          lastSyncedAt: new Date().toISOString(),
+          rawActivities: 0,
+          normalizedActivities: 0,
+          status: "error",
+          message:
+            syncError instanceof Error
+              ? syncError.message
+              : "Garmin sign-in succeeded, but the first sync did not complete.",
+        };
+      }
+
+      await onAuthenticated(result.session, syncSummary);
     } catch (authError) {
       setError(
         authError instanceof Error
@@ -68,6 +92,7 @@ export function LoginScreen({
           : "The Garmin authentication flow could not be completed.",
       );
     } finally {
+      setSubmitPhase("idle");
       setIsSubmitting(false);
     }
   };
@@ -100,8 +125,12 @@ export function LoginScreen({
               <strong>SQLite + raw JSON stored locally</strong>
             </div>
             <div>
-              <span>Current milestone</span>
-              <strong>Auth shell, secure storage, and dashboard foundation</strong>
+              <span>Garmin adapter</span>
+              <strong>
+                {storageSnapshot?.garminAdapterReady
+                  ? "Python adapter configured"
+                  : "Setup required or browser preview mode"}
+              </strong>
             </div>
           </div>
         </div>
@@ -112,8 +141,8 @@ export function LoginScreen({
           <p className="subtle-kicker">Sign in</p>
           <h2>Connect your Garmin account</h2>
           <p className="surface-copy">
-            The current scaffold uses a mocked Garmin adapter while the live
-            connector is being implemented.
+            The desktop runtime signs in through a local Python adapter, then
+            saves the Garmin token payload in the system keychain.
           </p>
 
           <form className="auth-form" onSubmit={handleSubmit}>
@@ -165,7 +194,11 @@ export function LoginScreen({
             )}
 
             <button className="primary-button" disabled={isSubmitting} type="submit">
-              {isSubmitting ? "Authenticating..." : "Sign in securely"}
+              {isSubmitting
+                ? submitPhase === "sync"
+                  ? "Syncing recent runs..."
+                  : "Authenticating..."
+                : "Sign in securely"}
             </button>
           </form>
 

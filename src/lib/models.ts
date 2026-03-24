@@ -8,9 +8,12 @@ export interface LoginCredentials {
 
 export interface LoginSession {
   athleteName: string;
+  fullName: string | null;
+  accountEmail: string;
   issuedAt: string;
   expiresAt: string;
   tokenLastFour: string;
+  unitSystem: string | null;
 }
 
 export interface SyncSummary {
@@ -26,9 +29,22 @@ export interface StorageSnapshot {
   rawDataDir: string;
   normalizedDataDir: string;
   databasePath: string;
+  garminAdapterReady: boolean;
   sessionInKeychain: boolean;
   lastSyncSummary: SyncSummary | null;
 }
+
+export interface GarminAuthChallenge {
+  status: "mfa_required";
+  message: string;
+}
+
+export interface GarminAuthSuccess {
+  status: "authenticated";
+  session: LoginSession;
+}
+
+export type GarminAuthResult = GarminAuthChallenge | GarminAuthSuccess;
 
 export interface MetricStat {
   label: string;
