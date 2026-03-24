@@ -1,4 +1,6 @@
-use chrono::{SecondsFormat, Utc};
+use chrono::{
+    Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, Utc, Weekday,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -135,6 +137,116 @@ struct GarminAdapterSyncResponse {
     token_store: String,
     activities: Vec<GarminSyncActivity>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricStat {
+    label: String,
+    value: String,
+    delta: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrendPoint {
+    label: String,
+    primary: f64,
+    accent: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardRing {
+    value: u8,
+    label: String,
+    caption: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DistributionSegment {
+    label: String,
+    value: u8,
+    tone: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityTableRow {
+    title: String,
+    date: String,
+    distance: String,
+    pace: String,
+    effort: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeatmapCell {
+    label: String,
+    value: u32,
+    level: u8,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardScenario {
+    eyebrow: String,
+    title: String,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_message: Option<String>,
+    insight_title: String,
+    insight: String,
+    key_stats: Vec<MetricStat>,
+    trend_title: String,
+    trend_caption: String,
+    trend: Vec<TrendPoint>,
+    ring: DashboardRing,
+    distribution_title: String,
+    distribution: Vec<DistributionSegment>,
+    activity_title: String,
+    activities: Vec<ActivityTableRow>,
+    notes_title: String,
+    notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heatmap_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heatmap: Option<Vec<HeatmapCell>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NormalizedActivityRow {
+    local_start_at: String,
+    utc_start_at: String,
+    distance_meters: f64,
+    duration_seconds: f64,
+    average_pace_seconds_per_km: Option<f64>,
+    average_heart_rate: Option<f64>,
+    max_heart_rate: Option<f64>,
+    elevation_gain_meters: Option<f64>,
+    training_load: Option<f64>,
+    activity_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActivityRecord {
+    activity_name: String,
+    local_start_at: NaiveDateTime,
+    utc_start_at: NaiveDateTime,
+    distance_meters: f64,
+    duration_seconds: f64,
+    average_pace_seconds_per_km: Option<f64>,
+    average_heart_rate: Option<f64>,
+    max_heart_rate: Option<f64>,
+    elevation_gain_meters: Option<f64>,
+    training_load: Option<f64>,
 }
 
 fn current_account_name() -> String {
@@ -525,6 +637,871 @@ fn query_count(database_path: &Path, table_name: &str) -> Result<u32, String> {
     Ok(count as u32)
 }
 
+fn parse_activity_datetime(value: &str) -> Option<NaiveDateTime> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.naive_local());
+    }
+
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(timestamp) = NaiveDateTime::parse_from_str(value, format) {
+            return Some(timestamp);
+        }
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return date.and_hms_opt(0, 0, 0);
+    }
+
+    None
+}
+
+fn load_normalized_activities(
+    database_path: &Path,
+    limit: usize,
+) -> Result<Vec<ActivityRecord>, String> {
+    let query = format!(
+        "SELECT \
+            local_start_at, \
+            utc_start_at, \
+            distance_meters, \
+            duration_seconds, \
+            average_pace_seconds_per_km, \
+            average_heart_rate, \
+            max_heart_rate, \
+            elevation_gain_meters, \
+            training_load, \
+            json_extract(normalized_json, '$.activityName') AS activity_name \
+         FROM activities_normalized \
+         ORDER BY utc_start_at DESC \
+         LIMIT {};",
+        limit
+    );
+
+    let output = Command::new("sqlite3")
+        .arg("-json")
+        .arg(database_path)
+        .arg(query)
+        .output()
+        .map_err(|error| format!("Failed to query normalized activities with sqlite3: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "sqlite3 activity query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("sqlite3 activity output was not valid UTF-8: {error}"))?;
+
+    let rows: Vec<NormalizedActivityRow> = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("Unable to parse normalized activity rows: {error}"))?;
+
+    let mut activities = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let Some(local_start_at) = parse_activity_datetime(&row.local_start_at) else {
+            continue;
+        };
+        let utc_start_at =
+            parse_activity_datetime(&row.utc_start_at).unwrap_or(local_start_at);
+
+        activities.push(ActivityRecord {
+            activity_name: row
+                .activity_name
+                .unwrap_or_else(|| "Running activity".to_string()),
+            local_start_at,
+            utc_start_at,
+            distance_meters: row.distance_meters,
+            duration_seconds: row.duration_seconds,
+            average_pace_seconds_per_km: row.average_pace_seconds_per_km,
+            average_heart_rate: row.average_heart_rate,
+            max_heart_rate: row.max_heart_rate,
+            elevation_gain_meters: row.elevation_gain_meters,
+            training_load: row.training_load,
+        });
+    }
+
+    activities.sort_by(|left, right| right.utc_start_at.cmp(&left.utc_start_at));
+    Ok(activities)
+}
+
+fn format_month_day(date: NaiveDate) -> String {
+    date.format("%b %d").to_string()
+}
+
+fn format_month_year(date: NaiveDate) -> String {
+    date.format("%B %Y").to_string()
+}
+
+fn format_distance_km(distance_meters: f64) -> String {
+    format!("{:.1} km", distance_meters / 1000.0)
+}
+
+fn format_duration(duration_seconds: f64) -> String {
+    let total_seconds = duration_seconds.max(0.0).round() as i64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_pace(value: Option<f64>) -> String {
+    let Some(seconds_per_km) = value.filter(|pace| *pace > 0.0) else {
+        return "—".to_string();
+    };
+
+    let total_seconds = seconds_per_km.round() as i64;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes}:{seconds:02} /km")
+}
+
+fn format_hr(value: Option<f64>) -> String {
+    value
+        .map(|heart_rate| format!("{:.0} bpm", heart_rate))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_elevation(value: Option<f64>) -> String {
+    value
+        .map(|elevation| format!("{:.0} m", elevation))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn percentage_change(current: f64, previous: f64) -> Option<f64> {
+    if previous.abs() < f64::EPSILON {
+        None
+    } else {
+        Some(((current - previous) / previous) * 100.0)
+    }
+}
+
+fn format_delta_percent(current: f64, previous: f64, fallback: &str) -> String {
+    percentage_change(current, previous)
+        .map(|delta| {
+            if delta.abs() < 0.5 {
+                "Flat versus the prior period".to_string()
+            } else {
+                format!("{:+.0}% versus the prior period", delta)
+            }
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn clamp_score(value: f64) -> u8 {
+    value.round().clamp(0.0, 100.0) as u8
+}
+
+fn activity_bucket(activity: &ActivityRecord) -> &'static str {
+    let distance_km = activity.distance_meters / 1000.0;
+    let pace = activity.average_pace_seconds_per_km.unwrap_or(0.0);
+    let load = activity.training_load.unwrap_or(0.0);
+
+    if distance_km >= 18.0 {
+        "Long run"
+    } else if load >= 100.0 || (pace > 0.0 && pace <= 315.0) {
+        "Quality"
+    } else if distance_km >= 10.0 || (pace > 0.0 && pace <= 360.0) {
+        "Steady"
+    } else {
+        "Easy"
+    }
+}
+
+fn distribution_segments(activities: &[ActivityRecord]) -> Vec<DistributionSegment> {
+    let mut easy = 0usize;
+    let mut steady = 0usize;
+    let mut quality = 0usize;
+    let mut long = 0usize;
+
+    for activity in activities {
+        match activity_bucket(activity) {
+            "Easy" => easy += 1,
+            "Steady" => steady += 1,
+            "Quality" => quality += 1,
+            "Long run" => long += 1,
+            _ => {}
+        }
+    }
+
+    let total = activities.len().max(1) as f64;
+    let make_segment = |label: &str, count: usize, tone: &str, detail: &str| DistributionSegment {
+        label: label.to_string(),
+        value: ((count as f64 / total) * 100.0).round() as u8,
+        tone: tone.to_string(),
+        detail: detail.to_string(),
+    };
+
+    vec![
+        make_segment("Easy", easy, "#ffd6cb", "controlled aerobic mileage"),
+        make_segment("Steady", steady, "#ffb59f", "moderate durable work"),
+        make_segment("Quality", quality, "#ff6a48", "faster or heavier efforts"),
+        make_segment("Long run", long, "#cb4026", "extended endurance sessions"),
+    ]
+}
+
+fn build_activity_rows(activities: &[ActivityRecord], limit: usize) -> Vec<ActivityTableRow> {
+    activities
+        .iter()
+        .take(limit)
+        .map(|activity| ActivityTableRow {
+            title: activity.activity_name.clone(),
+            date: format_month_day(activity.local_start_at.date()),
+            distance: format_distance_km(activity.distance_meters),
+            pace: format_pace(activity.average_pace_seconds_per_km),
+            effort: activity_bucket(activity).to_string(),
+        })
+        .collect()
+}
+
+fn average_distance(activities: &[ActivityRecord]) -> f64 {
+    if activities.is_empty() {
+        0.0
+    } else {
+        activities.iter().map(|activity| activity.distance_meters).sum::<f64>()
+            / activities.len() as f64
+    }
+}
+
+fn average_pace(activities: &[ActivityRecord]) -> Option<f64> {
+    let values: Vec<f64> = activities
+        .iter()
+        .filter_map(|activity| activity.average_pace_seconds_per_km)
+        .collect();
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn average_training_load(activities: &[ActivityRecord]) -> f64 {
+    let values: Vec<f64> = activities
+        .iter()
+        .filter_map(|activity| activity.training_load)
+        .collect();
+
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn build_empty_dashboard(range: &str) -> DashboardScenario {
+    let (title, message) = match range {
+        "daily" => (
+            "The daily dashboard needs at least one synced run.",
+            "Import Garmin activities to inspect the most recent workout, pacing, and training load on this machine.",
+        ),
+        "weekly" => (
+            "The weekly dashboard needs recent running activity.",
+            "Run a sync so the app can calculate seven-day volume, workout mix, and balance from local SQLite data.",
+        ),
+        _ => (
+            "The monthly dashboard needs synced history.",
+            "Import Garmin activities to unlock monthly progression charts, trend summaries, and the run-density heatmap.",
+        ),
+    };
+
+    DashboardScenario {
+        eyebrow: match range {
+            "daily" => "Daily review".to_string(),
+            "weekly" => "Weekly review".to_string(),
+            _ => "Monthly review".to_string(),
+        },
+        title: "No running data available".to_string(),
+        description: "The dashboard will switch from placeholder content to local analytics after the first successful sync.".to_string(),
+        is_empty: Some(true),
+        empty_title: Some(title.to_string()),
+        empty_message: Some(message.to_string()),
+        insight_title: "No primary insight yet.".to_string(),
+        insight: "Sync Garmin activities to start generating local training analysis.".to_string(),
+        key_stats: vec![],
+        trend_title: "No trend data".to_string(),
+        trend_caption: "Sync Garmin activities to populate this chart.".to_string(),
+        trend: vec![],
+        ring: DashboardRing {
+            value: 0,
+            label: "Readiness".to_string(),
+            caption: "This score appears after local activity data is available.".to_string(),
+        },
+        distribution_title: "Workout mix".to_string(),
+        distribution: vec![],
+        activity_title: "Recent runs".to_string(),
+        activities: vec![],
+        notes_title: "Coach notes".to_string(),
+        notes: vec![],
+        heatmap_title: None,
+        heatmap: None,
+    }
+}
+
+fn build_daily_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
+    let selected = &activities[0];
+    let recent_runs = &activities[..activities.len().min(7)];
+    let recent_baseline = &activities[1..activities.len().min(6)];
+    let baseline_distance = average_distance(recent_baseline);
+    let baseline_pace = average_pace(recent_baseline);
+    let pace_delta = match (selected.average_pace_seconds_per_km, baseline_pace) {
+        (Some(current), Some(previous)) if previous > 0.0 => {
+            if current < previous {
+                format!("{:.0}s per km quicker than recent average", previous - current)
+            } else {
+                format!("{:.0}s per km slower than recent average", current - previous)
+            }
+        }
+        _ => "Baseline pace will sharpen with more history".to_string(),
+    };
+
+    let insight_title = if selected.training_load.unwrap_or(0.0) >= 100.0 {
+        "The latest run landed as one of the heavier efforts in your recent block."
+    } else if selected.distance_meters >= baseline_distance.max(1.0) {
+        "The latest run stretched farther than your recent average."
+    } else {
+        "The latest run stayed in a controlled aerobic range."
+    };
+
+    let insight = format!(
+        "{} covered {} in {} with an average pace of {} and an average heart rate of {}.",
+        selected.activity_name,
+        format_distance_km(selected.distance_meters),
+        format_duration(selected.duration_seconds),
+        format_pace(selected.average_pace_seconds_per_km),
+        format_hr(selected.average_heart_rate),
+    );
+
+    let trend = recent_runs
+        .iter()
+        .rev()
+        .map(|activity| TrendPoint {
+            label: activity.local_start_at.date().format("%m/%d").to_string(),
+            primary: activity
+                .average_pace_seconds_per_km
+                .map(|pace| pace / 60.0)
+                .unwrap_or_else(|| (activity.distance_meters / 1000.0).max(0.1)),
+            accent: activity.average_heart_rate,
+        })
+        .collect();
+
+    let load_score = clamp_score(
+        selected.training_load.unwrap_or(0.0) * 0.6
+            + (selected.distance_meters / 1000.0) * 2.5
+            + selected.elevation_gain_meters.unwrap_or(0.0) * 0.04,
+    );
+
+    DashboardScenario {
+        eyebrow: "Daily review".to_string(),
+        title: format!(
+            "{} on {}",
+            selected.activity_name,
+            format_month_day(selected.local_start_at.date())
+        ),
+        description: "Review the latest synced run from the local Garmin archive and compare it against the recent baseline.".to_string(),
+        is_empty: None,
+        empty_title: None,
+        empty_message: None,
+        insight_title: insight_title.to_string(),
+        insight,
+        key_stats: vec![
+            MetricStat {
+                label: "Distance".to_string(),
+                value: format_distance_km(selected.distance_meters),
+                delta: if baseline_distance > 0.0 {
+                    format!(
+                        "{:+.1} km versus recent average",
+                        (selected.distance_meters - baseline_distance) / 1000.0
+                    )
+                } else {
+                    "Latest imported run".to_string()
+                },
+            },
+            MetricStat {
+                label: "Duration".to_string(),
+                value: format_duration(selected.duration_seconds),
+                delta: "Moving time for the selected run".to_string(),
+            },
+            MetricStat {
+                label: "Avg pace".to_string(),
+                value: format_pace(selected.average_pace_seconds_per_km),
+                delta: pace_delta,
+            },
+            MetricStat {
+                label: "Avg HR".to_string(),
+                value: format_hr(selected.average_heart_rate),
+                delta: format!(
+                    "Max recorded HR {}",
+                    format_hr(selected.max_heart_rate)
+                ),
+            },
+        ],
+        trend_title: "Recent pace trend".to_string(),
+        trend_caption: "Primary line shows average pace across the latest runs. Accent line shows average heart rate.".to_string(),
+        trend,
+        ring: DashboardRing {
+            value: load_score,
+            label: "Workout load".to_string(),
+            caption: format!(
+                "This score blends distance, elevation, and training load from the selected run. {}",
+                if load_score >= 75 {
+                    "It reads as a substantial session relative to the recent pattern."
+                } else {
+                    "It reads as a controlled day rather than a major strain spike."
+                }
+            ),
+        },
+        distribution_title: "Recent run mix".to_string(),
+        distribution: distribution_segments(&activities[..activities.len().min(14)]),
+        activity_title: "Latest imported runs".to_string(),
+        activities: build_activity_rows(activities, 6),
+        notes_title: "Execution notes".to_string(),
+        notes: vec![
+            format!(
+                "The latest effort was classified as {} based on distance, pace, and load.",
+                activity_bucket(selected)
+            ),
+            format!(
+                "Average pace currently sits at {} while the recent baseline sits near {}.",
+                format_pace(selected.average_pace_seconds_per_km),
+                format_pace(baseline_pace)
+            ),
+            format!(
+                "Elevation gain reached {}, which helps explain the overall load score.",
+                format_elevation(selected.elevation_gain_meters)
+            ),
+        ],
+        heatmap_title: None,
+        heatmap: None,
+    }
+}
+
+fn build_weekly_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
+    let anchor_date = activities[0].local_start_at.date();
+    let start_date = anchor_date - Duration::days(6);
+    let previous_start = start_date - Duration::days(7);
+    let previous_end = start_date - Duration::days(1);
+
+    let current_week: Vec<ActivityRecord> = activities
+        .iter()
+        .filter(|activity| {
+            let date = activity.local_start_at.date();
+            date >= start_date && date <= anchor_date
+        })
+        .cloned()
+        .collect();
+
+    let previous_week: Vec<ActivityRecord> = activities
+        .iter()
+        .filter(|activity| {
+            let date = activity.local_start_at.date();
+            date >= previous_start && date <= previous_end
+        })
+        .cloned()
+        .collect();
+
+    let current_distance = current_week.iter().map(|activity| activity.distance_meters).sum::<f64>();
+    let previous_distance = previous_week.iter().map(|activity| activity.distance_meters).sum::<f64>();
+    let current_duration = current_week.iter().map(|activity| activity.duration_seconds).sum::<f64>();
+    let active_days = current_week
+        .iter()
+        .map(|activity| activity.local_start_at.date())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let long_run = current_week
+        .iter()
+        .max_by(|left, right| left.distance_meters.total_cmp(&right.distance_meters))
+        .cloned();
+    let quality_count = current_week
+        .iter()
+        .filter(|activity| activity_bucket(activity) == "Quality")
+        .count();
+
+    let mut trend = Vec::with_capacity(7);
+
+    for day_offset in 0..7 {
+        let day = start_date + Duration::days(day_offset);
+        let day_runs: Vec<&ActivityRecord> = current_week
+            .iter()
+            .filter(|activity| activity.local_start_at.date() == day)
+            .collect();
+
+        let distance = day_runs
+            .iter()
+            .map(|activity| activity.distance_meters)
+            .sum::<f64>()
+            / 1000.0;
+        let load = if day_runs.is_empty() {
+            0.0
+        } else {
+            day_runs
+                .iter()
+                .filter_map(|activity| activity.training_load)
+                .sum::<f64>()
+                / day_runs.len() as f64
+        };
+
+        trend.push(TrendPoint {
+            label: day.format("%a").to_string(),
+            primary: distance,
+            accent: Some(load),
+        });
+    }
+
+    let balance_score = clamp_score(
+        48.0 + active_days as f64 * 7.0 + if long_run.is_some() { 6.0 } else { 0.0 }
+            - (quality_count.saturating_sub(2) as f64 * 10.0)
+            - if active_days == 7 { 8.0 } else { 0.0 },
+    );
+
+    DashboardScenario {
+        eyebrow: "Weekly review".to_string(),
+        title: format!("Week ending {}", format_month_day(anchor_date)),
+        description: "Track seven-day volume, workout mix, and how evenly the local training load was distributed across the week.".to_string(),
+        is_empty: None,
+        empty_title: None,
+        empty_message: None,
+        insight_title: if quality_count >= 3 {
+            "The week carried several higher-intensity touches."
+        } else if active_days <= 3 {
+            "The week was light on frequency and depended on a few larger runs."
+        } else {
+            "The week stayed reasonably balanced across volume and recovery."
+        }
+        .to_string(),
+        insight: format!(
+            "This seven-day block included {} runs across {} active days for a total of {} and {} of moving time.",
+            current_week.len(),
+            active_days,
+            format_distance_km(current_distance),
+            format_duration(current_duration),
+        ),
+        key_stats: vec![
+            MetricStat {
+                label: "Distance".to_string(),
+                value: format_distance_km(current_distance),
+                delta: format_delta_percent(
+                    current_distance,
+                    previous_distance,
+                    "No prior week available yet",
+                ),
+            },
+            MetricStat {
+                label: "Time on feet".to_string(),
+                value: format_duration(current_duration),
+                delta: "Seven-day moving total".to_string(),
+            },
+            MetricStat {
+                label: "Runs".to_string(),
+                value: format!("{} sessions", current_week.len()),
+                delta: format!("{} active days", active_days),
+            },
+            MetricStat {
+                label: "Longest run".to_string(),
+                value: long_run
+                    .as_ref()
+                    .map(|activity| format_distance_km(activity.distance_meters))
+                    .unwrap_or_else(|| "—".to_string()),
+                delta: long_run
+                    .as_ref()
+                    .map(|activity| format!("{} on {}", activity.activity_name, format_month_day(activity.local_start_at.date())))
+                    .unwrap_or_else(|| "No long run captured".to_string()),
+            },
+        ],
+        trend_title: "Volume by day".to_string(),
+        trend_caption: "Primary line shows kilometers by day. Accent line shows average training load for that day.".to_string(),
+        trend,
+        ring: DashboardRing {
+            value: balance_score,
+            label: "Weekly balance".to_string(),
+            caption: if balance_score >= 75 {
+                "The week looks balanced, with enough spread across the days to avoid leaning on a single run.".to_string()
+            } else {
+                "The week clustered stress into a narrower set of days, so the next block may benefit from smoother spacing.".to_string()
+            },
+        },
+        distribution_title: "Workout mix".to_string(),
+        distribution: distribution_segments(&current_week),
+        activity_title: "Runs captured this week".to_string(),
+        activities: build_activity_rows(&current_week, 6),
+        notes_title: "Weekly coaching notes".to_string(),
+        notes: vec![
+            format!("The week logged {} active days, leaving {} true rest days.", active_days, 7usize.saturating_sub(active_days)),
+            format!("Average training load per run landed around {:.0}.", average_training_load(&current_week)),
+            match long_run {
+                Some(activity) => format!(
+                    "The longest outing was {} at {}.",
+                    activity.activity_name,
+                    format_distance_km(activity.distance_meters)
+                ),
+                None => "No single long run stood out in this block.".to_string(),
+            },
+        ],
+        heatmap_title: None,
+        heatmap: None,
+    }
+}
+
+fn build_monthly_heatmap(activities: &[ActivityRecord], month_start: NaiveDate, month_end: NaiveDate) -> Vec<HeatmapCell> {
+    let mut grid_start = month_start;
+    while grid_start.weekday() != Weekday::Mon {
+        grid_start -= Duration::days(1);
+    }
+
+    let mut grid_end = month_end;
+    while grid_end.weekday() != Weekday::Sun {
+        grid_end += Duration::days(1);
+    }
+
+    let max_distance = activities
+        .iter()
+        .map(|activity| activity.distance_meters / 1000.0)
+        .fold(0.0_f64, f64::max);
+
+    let mut cells = Vec::new();
+    let mut current = grid_start;
+
+    while current <= grid_end {
+        let day_distance = activities
+            .iter()
+            .filter(|activity| activity.local_start_at.date() == current)
+            .map(|activity| activity.distance_meters / 1000.0)
+            .sum::<f64>();
+
+        let level = if day_distance <= 0.0 || max_distance <= 0.0 {
+            0
+        } else {
+            ((day_distance / max_distance) * 5.0).ceil().clamp(1.0, 5.0) as u8
+        };
+
+        cells.push(HeatmapCell {
+            label: format_month_day(current),
+            value: day_distance.round() as u32,
+            level,
+        });
+
+        current += Duration::days(1);
+    }
+
+    cells
+}
+
+fn build_monthly_dashboard(activities: &[ActivityRecord]) -> DashboardScenario {
+    let anchor_date = activities[0].local_start_at.date();
+    let month_start = anchor_date.with_day(1).unwrap_or(anchor_date);
+    let next_month = if anchor_date.month() == 12 {
+        NaiveDate::from_ymd_opt(anchor_date.year() + 1, 1, 1).unwrap_or(anchor_date)
+    } else {
+        NaiveDate::from_ymd_opt(anchor_date.year(), anchor_date.month() + 1, 1)
+            .unwrap_or(anchor_date)
+    };
+    let month_end = next_month - Duration::days(1);
+
+    let current_month: Vec<ActivityRecord> = activities
+        .iter()
+        .filter(|activity| {
+            let date = activity.local_start_at.date();
+            date >= month_start && date <= month_end
+        })
+        .cloned()
+        .collect();
+
+    let previous_month_end = month_start - Duration::days(1);
+    let previous_month_start = previous_month_end.with_day(1).unwrap_or(previous_month_end);
+    let previous_month: Vec<ActivityRecord> = activities
+        .iter()
+        .filter(|activity| {
+            let date = activity.local_start_at.date();
+            date >= previous_month_start && date <= previous_month_end
+        })
+        .cloned()
+        .collect();
+
+    let current_distance = current_month.iter().map(|activity| activity.distance_meters).sum::<f64>();
+    let previous_distance = previous_month.iter().map(|activity| activity.distance_meters).sum::<f64>();
+    let longest_run = current_month
+        .iter()
+        .max_by(|left, right| left.distance_meters.total_cmp(&right.distance_meters))
+        .cloned();
+    let best_pace = current_month
+        .iter()
+        .filter(|activity| activity.distance_meters >= 5000.0)
+        .filter_map(|activity| activity.average_pace_seconds_per_km)
+        .min_by(|left, right| left.total_cmp(right));
+
+    let weekly_buckets = (1u32..=5)
+        .map(|bucket| {
+            let bucket_runs: Vec<&ActivityRecord> = current_month
+                .iter()
+                .filter(|activity| ((activity.local_start_at.date().day() - 1) / 7) + 1 == bucket)
+                .collect();
+            let distance = bucket_runs
+                .iter()
+                .map(|activity| activity.distance_meters)
+                .sum::<f64>()
+                / 1000.0;
+            let load = if bucket_runs.is_empty() {
+                0.0
+            } else {
+                bucket_runs
+                    .iter()
+                    .filter_map(|activity| activity.training_load)
+                    .sum::<f64>()
+                    / bucket_runs.len() as f64
+            };
+
+            TrendPoint {
+                label: format!("W{bucket}"),
+                primary: distance,
+                accent: Some(load),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let active_days = current_month
+        .iter()
+        .map(|activity| activity.local_start_at.date())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    let block_quality = clamp_score(
+        42.0 + active_days as f64 * 1.8 + current_month.len() as f64 * 1.4
+            + longest_run
+                .as_ref()
+                .map(|activity| activity.distance_meters / 1000.0 * 0.8)
+                .unwrap_or(0.0),
+    );
+
+    DashboardScenario {
+        eyebrow: "Monthly review".to_string(),
+        title: format!("{} overview", format_month_year(anchor_date)),
+        description: "Step back and review cumulative volume, repeatability, and the shape of the local running block across the month.".to_string(),
+        is_empty: None,
+        empty_title: None,
+        empty_message: None,
+        insight_title: if longest_run
+            .as_ref()
+            .map(|activity| activity.distance_meters >= 20000.0)
+            .unwrap_or(false)
+        {
+            "The month established a durable long-run backbone."
+        } else if current_month.len() >= 12 {
+            "The month emphasized frequency and steady repeatability."
+        } else {
+            "The month remained lighter and more selective in total volume."
+        }
+        .to_string(),
+        insight: format!(
+            "The local archive captured {} runs across {} active days for a total of {} in {}.",
+            current_month.len(),
+            active_days,
+            format_distance_km(current_distance),
+            format_month_year(anchor_date),
+        ),
+        key_stats: vec![
+            MetricStat {
+                label: "Distance".to_string(),
+                value: format_distance_km(current_distance),
+                delta: format_delta_percent(
+                    current_distance,
+                    previous_distance,
+                    "No prior month available yet",
+                ),
+            },
+            MetricStat {
+                label: "Runs".to_string(),
+                value: format!("{} sessions", current_month.len()),
+                delta: format!("{} active days", active_days),
+            },
+            MetricStat {
+                label: "Longest run".to_string(),
+                value: longest_run
+                    .as_ref()
+                    .map(|activity| format_distance_km(activity.distance_meters))
+                    .unwrap_or_else(|| "—".to_string()),
+                delta: longest_run
+                    .as_ref()
+                    .map(|activity| format!("{} on {}", activity.activity_name, format_month_day(activity.local_start_at.date())))
+                    .unwrap_or_else(|| "No standout long run".to_string()),
+            },
+            MetricStat {
+                label: "Best pace".to_string(),
+                value: format_pace(best_pace),
+                delta: "Fastest average pace from runs longer than 5 km".to_string(),
+            },
+        ],
+        trend_title: "Weekly mileage across the month".to_string(),
+        trend_caption: "Primary line shows weekly kilometers. Accent line shows average load per run in that week bucket.".to_string(),
+        trend: weekly_buckets,
+        ring: DashboardRing {
+            value: block_quality,
+            label: "Block quality".to_string(),
+            caption: if block_quality >= 78 {
+                "The month reads as a coherent running block with enough frequency to build momentum.".to_string()
+            } else {
+                "The month stayed relatively light, which may be appropriate if this was a transition or recovery block.".to_string()
+            },
+        },
+        distribution_title: "Monthly run mix".to_string(),
+        distribution: distribution_segments(&current_month),
+        activity_title: "Monthly signature runs".to_string(),
+        activities: build_activity_rows(&current_month, 6),
+        notes_title: "Month-end notes".to_string(),
+        notes: vec![
+            format!(
+                "The current month logged {} runs with an average distance of {:.1} km.",
+                current_month.len(),
+                if current_month.is_empty() {
+                    0.0
+                } else {
+                    (current_distance / current_month.len() as f64) / 1000.0
+                }
+            ),
+            match longest_run {
+                Some(activity) => format!(
+                    "The longest outing reached {} and anchors the month.",
+                    format_distance_km(activity.distance_meters)
+                ),
+                None => "No long run anchor was found in this month.".to_string(),
+            },
+            format!(
+                "The monthly view currently compares against {} stored runs from the prior month.",
+                previous_month.len()
+            ),
+        ],
+        heatmap_title: Some("Run density calendar".to_string()),
+        heatmap: Some(build_monthly_heatmap(&current_month, month_start, month_end)),
+    }
+}
+
+fn build_dashboard_scenario(range: &str, activities: &[ActivityRecord]) -> DashboardScenario {
+    if activities.is_empty() {
+        return build_empty_dashboard(range);
+    }
+
+    match range {
+        "daily" => build_daily_dashboard(activities),
+        "weekly" => build_weekly_dashboard(activities),
+        "monthly" => build_monthly_dashboard(activities),
+        _ => build_daily_dashboard(activities),
+    }
+}
+
 fn persist_synced_activities(
     database_path: &Path,
     session: &LoginSession,
@@ -807,6 +1784,16 @@ fn sync_garmin_running_data(app: AppHandle) -> Result<SyncSummary, String> {
     Ok(summary)
 }
 
+#[tauri::command]
+fn load_dashboard_scenario(app: AppHandle, range: String) -> Result<DashboardScenario, String> {
+    let paths = resolve_storage_paths(&app)?;
+    ensure_storage_directories(&paths)?;
+    initialize_database(&paths.database_path)?;
+
+    let activities = load_normalized_activities(&paths.database_path, 400)?;
+    Ok(build_dashboard_scenario(&range, &activities))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(GarminRuntimeState::default())
@@ -827,6 +1814,7 @@ pub fn run() {
             load_sync_summary,
             clear_sync_summary,
             sync_garmin_running_data,
+            load_dashboard_scenario,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

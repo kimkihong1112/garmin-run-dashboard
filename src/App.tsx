@@ -88,6 +88,11 @@ export function App() {
     setSyncSummary(buildInitialSyncSummary());
   };
 
+  const handleSyncSummaryChange = async (nextSummary: SyncSummary) => {
+    await persistSyncSummary(nextSummary);
+    setSyncSummary(nextSummary);
+  };
+
   if (isBooting) {
     return (
       <main className="boot-screen">
@@ -116,6 +121,7 @@ export function App() {
     <DashboardShell
       bootError={bootError}
       onSignOut={handleSignOut}
+      onSyncSummaryChange={handleSyncSummaryChange}
       session={session}
       storageSnapshot={storageSnapshot}
       syncSummary={syncSummary}

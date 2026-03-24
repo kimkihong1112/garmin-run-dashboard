@@ -83,6 +83,9 @@ export interface DashboardScenario {
   eyebrow: string;
   title: string;
   description: string;
+  isEmpty?: boolean;
+  emptyTitle?: string;
+  emptyMessage?: string;
   insightTitle: string;
   insight: string;
   keyStats: MetricStat[];

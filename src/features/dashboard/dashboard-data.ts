@@ -6,7 +6,10 @@ export const DASHBOARD_SEGMENTS = [
   { label: "Monthly", value: "monthly" },
 ] as const satisfies { label: string; value: DashboardRange }[];
 
-export const DASHBOARD_SCENARIOS: Record<DashboardRange, DashboardScenario> = {
+export const DASHBOARD_FALLBACK_SCENARIOS: Record<
+  DashboardRange,
+  DashboardScenario
+> = {
   daily: {
     eyebrow: "Daily review",
     title: "Tuesday tempo execution",

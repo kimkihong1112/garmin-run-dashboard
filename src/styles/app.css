@@ -355,6 +355,12 @@ input {
   padding: 2rem 1.25rem;
 }
 
+.sidebar-actions {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: auto;
+}
+
 .brand-lockup {
   align-items: center;
   display: flex;
@@ -727,6 +733,26 @@ input {
   gap: 0.75rem;
   margin: 0;
   padding-left: 1.2rem;
+}
+
+.empty-state {
+  display: grid;
+  gap: 0.85rem;
+  justify-items: start;
+  margin-bottom: 1.5rem;
+  min-height: 15rem;
+}
+
+.empty-state h3 {
+  font-size: 1.5rem;
+  line-height: 1.05;
+  margin: 0;
+  max-width: 18ch;
+}
+
+.empty-state__button {
+  margin-top: 0.4rem;
+  min-width: 12rem;
 }
 
 .heatmap-grid {
